@@ -1,0 +1,12 @@
+# Analysis (the CLI needs only these three)
+mediapipe==1.1.1
+opencv-contrib-python==5.0.0.93
+numpy==2.5.4
+
+# Local web app (run_betavision.bat / python -m betavision_app)
+fastapi==0.146.0
+starlette==1.8.0
+pydantic==2.14.1
+uvicorn==0.54.0
+python-multipart==0.0.32
+imageio-ffmpeg==0.6.0    # bundles ffmpeg, used to make the browser-playable H.264 video
