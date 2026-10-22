@@ -4,66 +4,135 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>BetaVision</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23a5845a' stroke-width='2.2' stroke-linecap='round'%3E%3Cpath d='M9.5 3.5h4a5 5 0 0 1 4.8 6.4l-2.4 8.2a3.4 3.4 0 0 1-3.3 2.4H9.8a3.6 3.6 0 0 1-3.6-3.6V6.8a3.3 3.3 0 0 1 3.3-3.3z'/%3E%3Cpath d='M9.6 7.5v8'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M3.5 12.5c-.6-4.6 2.8-8.6 7.2-9 3.6-.3 7.6 1.6 9 5 1.5 3.8-.6 8.4-4.6 10-4.8 1.9-11 .1-11.6-6z' fill='%231D1F1C'/%3E%3Ccircle cx='11.5' cy='10.5' r='1.6' fill='%23F7F5F0'/%3E%3C/svg%3E">
+<script>
+  // apply the saved light/dark choice before the page paints
+  try { const t = localStorage.getItem("bv-theme"); if (t) document.documentElement.dataset.theme = t; } catch (_) { /* storage blocked */ }
+</script>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<div class="topo" aria-hidden="true"></div>
+<svg class="contours" viewBox="0 0 520 520" fill="none" aria-hidden="true">
+  <g stroke-width="1.5">
+    <path d="M60 260c0-110 90-200 200-200s200 90 200 200-90 200-200 200S60 370 60 260z"/>
+    <path d="M110 262c0-84 66-152 150-152 86 0 152 66 152 150 0 86-70 152-154 152-84 0-148-66-148-150z"/>
+    <path d="M160 264c0-58 44-104 100-104 58 0 102 44 102 100 0 58-46 104-104 104-56 0-98-44-98-100z"/>
+    <path d="M210 262c0-30 22-52 50-52 30 0 52 22 52 50 0 30-24 54-54 54-28 0-48-22-48-52z"/>
+  </g>
+</svg>
 
 <header class="site">
   <div class="brand">
-    <svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
-      <path d="M9.5 3.5h4a5 5 0 0 1 4.8 6.4l-2.4 8.2a3.4 3.4 0 0 1-3.3 2.4H9.8a3.6 3.6 0 0 1-3.6-3.6V6.8a3.3 3.3 0 0 1 3.3-3.3z"/>
-      <path d="M9.6 7.5v8"/>
-    </svg>
+    <svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><path class="blob" d="M3.5 12.5c-.6-4.6 2.8-8.6 7.2-9 3.6-.3 7.6 1.6 9 5 1.5 3.8-.6 8.4-4.6 10-4.8 1.9-11 .1-11.6-6z"/><circle class="eye" cx="11.5" cy="10.5" r="1.6"/></svg>
     <span class="name">BetaVision</span>
   </div>
-  <span class="tag">Climbing technique analyzer · runs on this computer</span>
+  <div class="head-right">
+    <nav class="steps" aria-label="Steps">
+      <span class="step" data-step="1"><span class="num">1</span><span class="label">Upload</span></span>
+      <span class="dash" data-after="1"></span>
+      <span class="step" data-step="2"><span class="num">2</span><span class="label">Mark route</span></span>
+      <span class="dash" data-after="2"></span>
+      <span class="step" data-step="3"><span class="num">3</span><span class="label">Analysis</span></span>
+    </nav>
+    <button id="theme" class="round-btn" type="button" aria-label="Switch between light and dark mode">
+      <svg class="i-moon" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>
+      <svg class="i-sun" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+    </button>
+  </div>
 </header>
 
 <main>
   <!-- 1. upload -->
-  <section id="step-upload" class="card">
-    <label id="drop" class="drop" tabindex="0">
-      <input id="file" type="file" accept=".mp4,.mov,.avi,video/mp4,video/quicktime,video/x-msvideo" hidden>
-      <svg class="drop-icon" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <path d="M14 30c-3-1-5-4-4-8 1-3 4-6 8-6 2-5 7-8 12-6 4 1 7 5 7 9 3 1 5 4 4 7-1 3-3 4-6 4"/>
-        <path d="M24 22v16M18 28l6-6 6 6"/>
-      </svg>
-      <span class="drop-title">Drop your send here</span>
-      <span class="drop-sub">or <u>browse</u> for a video · .mp4, .mov or .avi</span>
-    </label>
-    <label class="check" id="still-row"><input type="checkbox" id="still"> Filmed on a tripod (skip camera tracking)</label>
-    <div id="upload-progress" class="progress-block" hidden>
-      <div class="progress-label"><span id="upload-label">Uploading…</span><span id="upload-pct">0%</span></div>
-      <div class="bar"><div id="upload-bar"></div></div>
+  <section id="step-upload" class="upload-page">
+    <div class="hero">
+      <span class="eyebrow">CLIMBING TECHNIQUE ANALYZER</span>
+      <h1>See the beta in your send.</h1>
+      <p class="lede">Drop in a video of your climb. BetaVision tracks your joints, follows you hold by hold, and shows how you moved.</p>
     </div>
-    <p id="upload-error" class="error" hidden></p>
+
+    <div class="upload-grid">
+      <div class="upload-col">
+        <label id="drop" class="drop" tabindex="0">
+          <input id="file" type="file" accept=".mp4,.mov,.avi,video/mp4,video/quicktime,video/x-msvideo" hidden>
+          <span class="drop-top">
+            <svg class="drop-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 12.5c-.6-4.6 2.8-8.6 7.2-9 3.6-.3 7.6 1.6 9 5 1.5 3.8-.6 8.4-4.6 10-4.8 1.9-11 .1-11.6-6z"/><circle cx="11.5" cy="10.5" r="1.6"/></svg>
+            <span class="mono small-mono">MP4 · MOV · AVI</span>
+          </span>
+          <span class="drop-text">
+            <span class="drop-title">Your climb</span>
+            <span class="drop-sub">Drag a video here or browse</span>
+          </span>
+          <span class="btn primary">Choose file</span>
+        </label>
+        <label class="check" id="still-row"><input type="checkbox" id="still"> Filmed on a tripod (skip camera tracking)</label>
+        <div id="upload-progress" class="panel progress-panel" hidden>
+          <div class="progress-label"><span id="upload-label">Uploading…</span><span id="upload-pct">0%</span></div>
+          <div class="bar"><div id="upload-bar"></div></div>
+        </div>
+        <p id="upload-error" class="error" hidden></p>
+      </div>
+
+      <ol class="how panel">
+        <li><span class="num-circle">1</span><span><b>Upload</b><span class="muted-line">One video of the whole climb.</span></span></li>
+        <li><span class="num-circle">2</span><span><b>Mark the route</b><span class="muted-line">Click a hold to find every hold of that colour.</span></span></li>
+        <li><span class="num-circle">3</span><span><b>Read the beta</b><span class="muted-line">Annotated video, hold sequence and joint angles.</span></span></li>
+      </ol>
+    </div>
+
+    <div class="tips">
+      <span><i class="pebble"></i>Whole wall in frame</span>
+      <span><i class="pebble"></i>Tripod or steady pan</span>
+      <span><i class="pebble"></i>Climber visible start to finish</span>
+    </div>
   </section>
 
   <!-- 2. mark the route -->
-  <section id="step-holds" class="card" hidden>
-    <div class="card-head">
-      <div>
-        <h2>Mark the route</h2>
-        <p class="hint">Click one hold of your route to find every hold of that colour. Right-click a wrong hold or volume to remove it,
-          tag your start and end holds, then analyze. Scroll to zoom, drag to move.</p>
-      </div>
-      <span id="video-name" class="pill"></span>
-    </div>
-
+  <section id="step-holds" hidden>
     <div class="picker">
-      <div class="canvas-wrap">
-        <canvas id="canvas"></canvas>
-        <div id="canvas-msg" class="canvas-msg" hidden></div>
-        <div class="zoom">
-          <button class="icon-btn" id="zoom-in" title="Zoom in (+)">+</button>
-          <button class="icon-btn" id="zoom-out" title="Zoom out (−)">−</button>
-          <button class="icon-btn" id="zoom-fit" title="Fit (0)">⤢</button>
+      <div class="picker-main">
+        <div class="page-head">
+          <h1>Tap a hold to mark your route</h1>
+          <span id="video-name" class="mono meta"></span>
+        </div>
+        <div class="canvas-wrap">
+          <canvas id="canvas"></canvas>
+          <div id="canvas-msg" class="canvas-msg" hidden></div>
+          <div class="zoom">
+            <button class="round-btn small" id="zoom-in" title="Zoom in (+)">+</button>
+            <button class="round-btn small" id="zoom-out" title="Zoom out (−)">−</button>
+            <button class="round-btn small" id="zoom-fit" title="Fit (0)">⤢</button>
+          </div>
+        </div>
+        <p class="hint small">Right-click a wrong hold or volume to remove it. Scroll to zoom, drag to move.</p>
+        <div class="field frame-field" id="frame-field">
+          <label class="field-label" for="frame">Frame <span id="frame-label" class="mono muted"></span></label>
+          <input id="frame" type="range" min="0" value="0">
+        </div>
+
+        <div class="options">
+          <div class="field notes-field">
+            <label class="field-label" for="notes">Sticky notes <span class="muted">optional, one per line</span></label>
+            <textarea id="notes" rows="3" spellcheck="false" placeholder="0:04-0:06 heel hook @rfoot&#10;20-21 footswap&#10;0:33-0:35 drop knee @5"></textarea>
+            <p class="hint small">Time range, text, then optionally <code>@5</code> (hold 5), <code>@V1</code> (a volume), <code>@hand</code>, <code>@foot</code>, <code>@lfoot</code> … Without one, the note pins itself to the hold in use.</p>
+            <p id="notes-error" class="error small" hidden></p>
+          </div>
+          <div class="field">
+            <label class="field-label" for="model">Pose model</label>
+            <select id="model">
+              <option value="lite">Lite · fastest</option>
+              <option value="full" selected>Full · balanced</option>
+              <option value="heavy">Heavy · most accurate, slow</option>
+            </select>
+            <label class="check" id="lock-row" hidden><input type="checkbox" id="lock" checked><span>Lock each hold onto the wall <span class="muted">(slower, steadier outlines)</span></span></label>
+          </div>
         </div>
       </div>
 
-      <aside class="tools">
+      <aside class="tools panel">
+        <div class="tools-head">
+          <h2>Pick the climb</h2>
+          <p class="hint">Click one hold of your route to find every hold of that colour, then tag your start and end holds.</p>
+        </div>
         <div class="field">
           <span class="field-label">Click mode <kbd>M</kbd></span>
           <div class="seg" role="radiogroup">
@@ -73,39 +142,37 @@
         </div>
         <div class="field">
           <span class="field-label">Tag holds</span>
-          <div class="row">
-            <button id="tag-start" class="btn ghost small"><i class="dot start"></i>Start <kbd>S</kbd></button>
-            <button id="tag-end" class="btn ghost small"><i class="dot end"></i>End <kbd>E</kbd></button>
+          <div class="chips">
+            <button id="tag-start" class="chip"><i class="dot start"></i>Start <kbd>S</kbd></button>
+            <button id="tag-end" class="chip"><i class="dot end"></i>End <kbd>E</kbd></button>
           </div>
         </div>
         <div class="field">
           <span class="field-label">Volumes <span class="muted">grey ones are found for you</span></span>
-          <div class="row">
-            <button id="tag-volume" class="btn ghost small" title="Next click outlines a volume the auto-detect missed">Add by click <kbd>V</kbd></button>
-            <button id="tag-poly" class="btn ghost small" title="Click the volume's corners; click the first corner again or press Enter to finish">Trace corners <kbd>P</kbd></button>
+          <div class="chips">
+            <button id="tag-volume" class="chip" title="Next click outlines a volume the auto-detect missed">Add by click <kbd>V</kbd></button>
+            <button id="tag-poly" class="chip" title="Click the volume's corners; click the first corner again or press Enter to finish">Trace corners <kbd>P</kbd></button>
           </div>
         </div>
-        <div class="field" id="frame-field">
-          <label class="field-label" for="frame">Frame <span id="frame-label" class="muted"></span></label>
-          <input id="frame" type="range" min="0" value="0">
-        </div>
         <div class="field">
-          <label class="field-label" for="tol">Colour tolerance <span id="tol-label" class="muted">22</span></label>
+          <label class="field-label" for="tol">Colour tolerance <span id="tol-label" class="mono muted">22</span></label>
           <input id="tol" type="range" min="1" max="60" value="22">
         </div>
         <div class="field">
-          <label class="field-label" for="minsize">Minimum hold size <span id="minsize-label" class="muted">3</span></label>
+          <label class="field-label" for="minsize">Minimum hold size <span id="minsize-label" class="mono muted">3</span></label>
           <input id="minsize" type="range" min="0" max="50" value="3">
         </div>
-        <div class="row">
-          <button id="undo" class="btn ghost small">Undo <kbd>Z</kbd></button>
-          <button id="clear" class="btn ghost small">Clear <kbd>R</kbd></button>
+        <div class="chips">
+          <button id="undo" class="chip">Undo <kbd>Z</kbd></button>
+          <button id="clear" class="chip">Clear <kbd>R</kbd></button>
         </div>
 
         <div class="status-box">
           <div id="mode-status" class="now"></div>
-          <div class="counts"><span id="n-holds">0 holds</span><span id="n-start">Start 0/2</span><span id="n-end">End —</span></div>
-          <div class="counts"><span id="n-vols">0 volumes</span><span id="n-cuts"></span></div>
+          <div class="kv"><span>Holds on route</span><span id="n-holds">0 holds</span></div>
+          <div class="kv"><span>Start / end</span><span><span id="n-start">Start 0/2</span> · <span id="n-end">End —</span></span></div>
+          <div class="kv"><span>Volumes</span><span id="n-vols">0 volumes</span></div>
+          <div class="kv cuts"><span></span><span id="n-cuts"></span></div>
           <ul class="legend">
             <li><i class="sw auto"></i>by colour</li>
             <li><i class="sw manual"></i>single</li>
@@ -116,37 +183,21 @@
           </ul>
         </div>
 
-        <button id="analyze" class="btn primary">Analyze climb <kbd>Enter</kbd></button>
+        <button id="analyze" class="btn primary block">Analyze climb
+          <svg class="arrow" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+          <kbd>Enter</kbd></button>
         <button id="skip" class="btn link">Skip holds, just track the body</button>
         <button id="restart-1" class="btn link muted-link">Choose a different video</button>
       </aside>
     </div>
-
-    <div class="options">
-      <div class="field notes-field">
-        <label class="field-label" for="notes">Sticky notes <span class="muted">optional, one per line</span></label>
-        <textarea id="notes" rows="3" spellcheck="false" placeholder="0:04-0:06 heel hook @rfoot&#10;20-21 footswap&#10;0:33-0:35 drop knee @5"></textarea>
-        <p class="hint small">Time range, text, then optionally <code>@5</code> (hold 5), <code>@V1</code> (a volume), <code>@hand</code>, <code>@foot</code>, <code>@lfoot</code> … Without one, the note pins itself to the hold in use.</p>
-        <p id="notes-error" class="error small" hidden></p>
-      </div>
-      <div class="field">
-        <label class="field-label" for="model">Pose model</label>
-        <select id="model">
-          <option value="lite">Lite · fastest</option>
-          <option value="full" selected>Full · balanced</option>
-          <option value="heavy">Heavy · most accurate, slow</option>
-        </select>
-        <label class="check" id="lock-row" hidden><input type="checkbox" id="lock" checked><span>Lock each hold onto the wall <span class="muted">(slower, steadier outlines)</span></span></label>
-      </div>
-    </div>
   </section>
 
   <!-- 3. processing -->
-  <section id="step-run" class="card center" hidden>
+  <section id="step-run" class="panel center" hidden>
     <div class="spinner" aria-hidden="true"></div>
     <h2 id="run-title">Reading the beta…</h2>
-    <p id="run-message" class="hint">Tracking the climber</p>
-    <div class="progress-block narrow">
+    <p id="run-message" class="hint"></p>
+    <div class="progress-block">
       <div class="progress-label"><span id="run-stage">Tracking</span><span id="run-pct">0%</span></div>
       <div class="bar"><div id="run-bar"></div></div>
     </div>
@@ -154,43 +205,44 @@
   </section>
 
   <!-- 4. results -->
-  <section id="step-results" class="card" hidden>
-    <div class="card-head">
-      <div>
-        <h2>Your send, analyzed</h2>
-        <p id="result-sub" class="hint"></p>
-      </div>
-      <div class="row">
-        <a id="download" class="btn primary" download>Download annotated video</a>
-      </div>
-    </div>
+  <section id="step-results" hidden>
     <div class="results">
-      <div class="player"><video id="player" controls playsinline preload="metadata"></video>
-        <p id="player-note" class="player-note" hidden>This browser can't play the video here. Use Download, or open BetaVision in Chrome or Edge.</p></div>
-      <div class="panel">
+      <div class="results-main">
+        <div class="page-head">
+          <h1>Your send, analyzed</h1>
+          <span id="result-sub" class="mono meta"></span>
+        </div>
+        <div class="player"><video id="player" controls playsinline preload="metadata"></video>
+          <p id="player-note" class="player-note" hidden>This browser can't play the video here. Use Download, or open BetaVision in Chrome or Edge.</p></div>
         <div class="stats" id="stats"></div>
-        <h3>Hold sequence</h3>
+        <div class="panel angles-panel">
+          <div class="section-head"><h2>Joint angles</h2><span class="mono meta">180° = straight limb</span></div>
+          <p class="hint small">Across all frames where the climber was tracked.</p>
+          <table id="angles" class="angles"></table>
+        </div>
+      </div>
+
+      <aside class="results-side">
+        <div class="section-head"><h2>Hold sequence</h2><span id="moves-count" class="mono meta"></span></div>
         <p class="hint small">Each hand or foot that stayed on a hold for at least 0.2 s. Click a row to jump there.</p>
         <ol id="moves" class="moves"></ol>
         <div id="notes-block" hidden>
-          <h3>Sticky notes</h3>
-          <ul id="notes-list" class="moves"></ul>
+          <div class="section-head"><h2>Sticky notes</h2></div>
+          <ul id="notes-list" class="moves notes-list"></ul>
         </div>
-        <h3>Joint angles</h3>
-        <p class="hint small">Across all frames where the climber was tracked. 180° is a straight limb.</p>
-        <table id="angles" class="angles"></table>
-        <div class="row foot">
-          <a id="csv" class="btn link" download>Frame-by-frame data (CSV)</a>
-          <button id="restart-2" class="btn ghost">Analyze another climb</button>
+        <div class="side-actions">
+          <button id="restart-2" class="btn outline">New video</button>
+          <a id="download" class="btn primary" download>Download video</a>
         </div>
-      </div>
+        <a id="csv" class="btn link" download>Frame-by-frame data (CSV)</a>
+      </aside>
     </div>
   </section>
 
-  <section id="step-error" class="card center" hidden>
+  <section id="step-error" class="panel center" hidden>
     <h2>That one didn't go</h2>
     <p id="error-message" class="error"></p>
-    <button id="restart-3" class="btn ghost">Start over</button>
+    <button id="restart-3" class="btn outline">Start over</button>
   </section>
 </main>
 
