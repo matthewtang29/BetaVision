@@ -232,7 +232,46 @@ def build_panorama(video, cam, base_frame, n_samples=24, max_side=4000):
     return pano, T
 
 
-
+def pick_keyframes(cam, w, h, max_frames=8, margin=0.12, cover=0.97, n_candidates=150):
+    """Choose a few frames that between them show the whole wall, so the route can be
+    marked frame by frame instead of on a stitched picture. Greedy set cover in base-frame
+    pixels: each step takes the frame whose middle part (inset by `margin`, where holds
+    aren't cut off by the edge) shows the most wall the frames so far haven't.
+    Returns frame indices in video order."""
+    n = len(cam)
+    cands = sorted(set(np.linspace(0, n - 1, min(n, n_candidates)).round().astype(int).tolist()))
+    mx, my = margin * w, margin * h
+    full = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
+    inner = np.float32([[mx, my], [w - mx, my], [w - mx, h - my], [mx, h - my]]).reshape(-1, 1, 2)
+    quads = {}
+    for i in cands:
+        to_base = np.linalg.inv(cam[i])
+        q = cv2.perspectiveTransform(full, to_base).reshape(-1, 2)
+        area = cv2.contourArea(q)
+        if not cv2.isContourConvex(q.astype(np.float32)) or not 0.25 * w * h < area < 4 * w * h:
+            continue                                    # tracking glitch: not a believable view of the wall
+        quads[i] = cv2.perspectiveTransform(inner, to_base).reshape(-1, 2)
+    if not quads:
+        return [n // 2]
+    allq = np.vstack(list(quads.values()))
+    x0, y0 = allq.min(axis=0)
+    s = 200 / max(1.0, float((allq.max(axis=0) - (x0, y0)).max()))     # coarse grid, ~200 cells across
+    GW, GH = (np.ceil((allq.max(axis=0) - (x0, y0)) * s) + 1).astype(int)
+    masks = {}
+    for i, q in quads.items():
+        m = np.zeros((GH, GW), np.uint8)
+        cv2.fillConvexPoly(m, ((q - (x0, y0)) * s).round().astype(np.int32), 1)
+        masks[i] = m.astype(bool)
+    wall = np.logical_or.reduce(list(masks.values()))
+    covered = np.zeros_like(wall)
+    picked = []
+    while len(picked) < max_frames and covered.sum() < cover * wall.sum():
+        gain, best = max(((masks[i] & ~covered).sum(), i) for i in masks if i not in picked)
+        if picked and gain < 0.02 * wall.sum():      # only a sliver more: not worth a frame
+            break
+        picked.append(best)
+        covered |= masks[best]
+    return sorted(picked)
 
 
 def lock_on(video, cam, items, ref_frames=None, radius_frac=0.3, step=2, progress=None):

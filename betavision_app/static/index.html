@@ -104,8 +104,14 @@
           </div>
         </div>
         <p class="hint small">Right-click a wrong hold or volume to remove it. Scroll to zoom, drag to move.</p>
+        <div class="field keyframes" id="keyframes" hidden>
+          <span class="field-label">Frames <span class="muted"><kbd>[</kbd> <kbd>]</kbd> previous / next</span></span>
+          <div class="strip" id="strip"></div>
+          <p id="keyframes-note" class="hint small"></p>
+        </div>
         <div class="field frame-field" id="frame-field">
-          <label class="field-label" for="frame">Frame <span id="frame-label" class="mono muted"></span></label>
+          <div class="field-label"><label for="frame">Frame <span id="frame-label" class="mono muted"></span></label>
+            <button id="add-frame" class="chip add-frame" hidden>+ Add this frame</button></div>
           <input id="frame" type="range" min="0" value="0">
         </div>
 

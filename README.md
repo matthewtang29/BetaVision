@@ -158,7 +158,7 @@ Prefer clicking to typing commands? BetaVision also runs as a local web app. It 
 **Use it:**
 
 1. Drag a video (.mp4, .mov or .avi) onto the page, or click to browse. Tick *Filmed on a tripod* to skip camera tracking (same as `--still`).
-2. BetaVision follows the camera. If it moved, you mark the route on the whole wall stitched into one picture; otherwise on a frame you choose with the slider.
+2. BetaVision follows the camera. If it moved, it picks a few sharp frames that between them show the whole wall (a strip under the picture; **[** and **]** step through them). Mark each hold once, on whichever frame shows it best; holds found on one frame are shown on all of them. If the climber hides a hold on every one of them, drag the Frame slider to a better moment and click *Add this frame*. If the camera didn't move, you mark a frame you choose with the slider.
 3. Mark the route just like the OpenCV picker: click one hold to find every hold of that colour, switch to *Just this hold* (**M**) for any it missed, right-click wrong holds or volumes, tag start (**S**) and end (**E**) holds. Volumes are found for you; add a missed one with **V** (click it) or **P** (click its corners). Scroll to zoom, drag to move. Or choose *Skip holds* to track the body only.
 4. Optionally type sticky notes, one per line, in the same format as a notes file (see [Sticky notes](#sticky-notes)).
 5. Click **Analyze climb**. When it's done you get the annotated video in the page, the results (how much of the climb was tracked, top-out time, holds used, the hold and volume sequence, where each note was pinned, joint angle ranges) and a **Download annotated video** button.

@@ -8,7 +8,7 @@ const STEPS = ["step-upload", "step-holds", "step-run", "step-results", "step-er
 const VIDEO_EXT = [".mp4", ".mov", ".avi"];
 const COLORS = { auto: "#3fae5a", manual: "#e38b2c", start: "#1fb8c9", end: "#d0473b", vol: "#ebebeb", cut: "#ff69b4" };
 
-let job = null;          // {id, name, frames, fps, width, height, pano, camera_moved}
+let job = null;          // {id, name, frames, fps, width, height, keyframes, camera_moved}
 let P = null;            // picker state sent to the server (see jobs.Job.build_route)
 let holds = [], vols = [], skippedVols = 0;
 let mode = "AUTO", tag = null, poly = [], history = [];
@@ -127,7 +127,7 @@ function setBar(which, f, label) {
 
 // ------------------------------------------------------------------ status polling (preparing + analysis)
 const STAGES = {
-  camera: "Following the camera", stitch: "Stitching the wall", queued: "Waiting", model: "Downloading",
+  camera: "Following the camera", keyframes: "Choosing frames", queued: "Waiting", model: "Downloading",
   lock: "Locking holds", track: "Tracking", draw: "Drawing", encode: "Encoding",
 };
 
@@ -146,8 +146,8 @@ async function poll() {
   try { s = await api(`/api/jobs/${jobId}`); } catch (e) { return fail(e.message); }
   $("run-stage").textContent = STAGES[s.stage] || "Working";
   $("run-message").textContent = s.message || "";
-  setBar("run", ["stitch", "encode", "model", "queued"].includes(s.stage) ? (s.stage === "encode" ? 1 : 0) : s.progress);
-  $("run-bar").parentElement.classList.toggle("busy", ["stitch", "encode", "model"].includes(s.stage));
+  setBar("run", ["keyframes", "encode", "model", "queued"].includes(s.stage) ? (s.stage === "encode" ? 1 : 0) : s.progress);
+  $("run-bar").parentElement.classList.toggle("busy", ["keyframes", "encode", "model"].includes(s.stage));
   if (s.state === "error") fail(s.message);
   else if (s.state === "picking") { clearInterval(pollTimer); startPicker(s.info); }
   else if (s.state === "done") { clearInterval(pollTimer); showResults(s.results); }
@@ -158,20 +158,21 @@ const canvas = $("canvas"), ctx = canvas.getContext("2d");
 
 function startPicker(info) {
   job = info;
-  P = { frame: 0, tol: 22, min_size: 3, auto: [], manual: [], deleted: [], starts: [], end: null,
-        vols_manual: [], vols_deleted: [] };
+  const first = job.keyframes ? job.keyframes[0] : 0;
+  P = { frame: first, frames: job.keyframes ? job.keyframes.slice() : null, tol: 22, min_size: 3,
+        auto: [], manual: [], deleted: [], starts: [], end: null, vols_manual: [], vols_deleted: [] };
   holds = []; vols = []; history = []; poly = []; tag = null; setMode("AUTO");
-  $("frame-field").hidden = job.pano;
-  if (job.pano) $("video-name").textContent = "Whole wall (stitched)";
+  $("keyframes").hidden = $("add-frame").hidden = !job.keyframes;
+  $("strip").dataset.html = "";
   $("frame").max = Math.max(0, job.frames - 1);
-  $("frame").value = 0;
+  $("frame").value = first;
   $("tol").value = 22; $("minsize").value = 3;
   $("tol-label").textContent = 22; $("minsize-label").textContent = 3;
   $("lock-row").hidden = !job.camera_moved;
   $("notes-error").hidden = true;
-  updateFrameLabel(0);
+  updateFrameLabel(first);
   show("step-holds");
-  loadPicture(0, true);
+  loadPicture(first, true);
 }
 
 function loadPicture(i, fit) {
@@ -179,15 +180,71 @@ function loadPicture(i, fit) {
   next.onload = () => {
     img = next;
     P.frame = i;
+    renderStrip();
     if (fit) fitView();
     draw();
     refreshRoute();
   };
-  next.src = `/api/jobs/${job.id}/frame/${job.pano ? 0 : i}`;
+  next.src = `/api/jobs/${job.id}/frame/${i}`;
 }
 
 function updateFrameLabel(i) {
   $("frame-label").textContent = `${i} · ${(i / job.fps).toFixed(1)} s`;
+}
+
+function goToFrame(i) {
+  if (tag === "poly") setTag(null);              // a traced volume's corners all belong to one frame
+  $("frame").value = i;
+  updateFrameLabel(i);
+  loadPicture(i, false);
+}
+
+// ---------- keyframes (camera moved): a few frames that between them show the whole wall
+const hasMarks = (f) => [P.auto, P.manual, P.vols_manual].some((list) => list.some((c) => c.frame === f)) ||
+  [P.deleted, P.starts, P.vols_deleted, P.end ? [P.end] : []].some((list) => list.some((p) => p[2] === f));
+
+function renderStrip() {
+  if (!P.frames) return;
+  const strip = $("strip");
+  const html = P.frames.map((f, k) =>
+    `<div class="kf${f === P.frame ? " on" : ""}"><button class="kf-pick" data-f="${f}" title="Frame ${f}">` +
+    `<img src="/api/jobs/${job.id}/frame/${f}?w=240" alt=""><span class="mono">${k + 1} · ${(f / job.fps).toFixed(1)} s</span></button>` +
+    (P.frames.length > 1 && !hasMarks(f) ? `<button class="kf-x" data-f="${f}" title="Remove this frame">×</button>` : "") +
+    `</div>`).join("");
+  if (strip.dataset.html !== html) {             // only rebuild when something changed (no thumbnail flicker)
+    strip.dataset.html = html;
+    strip.innerHTML = html;
+    strip.querySelector(".kf.on")?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+  const here = P.frames.includes(P.frame);
+  $("add-frame").disabled = here;
+  $("keyframes-note").textContent = `${P.frames.length} frame${P.frames.length === 1 ? "" : "s"} cover the wall. ` +
+    "Mark each hold once, on any frame. Use the slider to find a better view and add it.";
+}
+
+$("strip").addEventListener("click", (e) => {
+  const pick = e.target.closest(".kf-pick"), x = e.target.closest(".kf-x");
+  if (pick) goToFrame(+pick.dataset.f);
+  else if (x) {
+    P.frames = P.frames.filter((f) => f !== +x.dataset.f);
+    if (+x.dataset.f === P.frame) goToFrame(P.frames[0]); else { renderStrip(); refreshRoute(); }
+  }
+});
+
+function pinFrame() {                            // marks on a frame make it part of the route's frames
+  if (P.frames && !P.frames.includes(P.frame)) {
+    P.frames.push(P.frame); P.frames.sort((a, b) => a - b);
+    renderStrip();
+  }
+}
+
+function stepKeyframe(d) {
+  if (!P.frames) return;
+  const k = P.frames.findIndex((f) => f >= P.frame);
+  const at = k < 0 ? P.frames.length : k;
+  const exact = P.frames[at] === P.frame;
+  const next = d > 0 ? (exact ? at + 1 : at) : at - 1;
+  if (next >= 0 && next < P.frames.length) goToFrame(P.frames[next]);
 }
 
 // ---------- view: zoom + pan (image px at the canvas's top-left = ox, oy)
@@ -264,7 +321,7 @@ function draw() {
     ctx.stroke();
   }
   for (const c of P.auto) {                      // where you clicked (AUTO samples)
-    if (!job.pano && c.frame !== P.frame) continue;
+    if (c.frame !== P.frame) continue;
     const r = 7 / view.s;
     ctx.lineWidth = 2 / view.s;
     ctx.strokeStyle = "#ffffff";
@@ -331,8 +388,7 @@ function flash(msg) {
   msgTimer = setTimeout(() => (el.hidden = true), 2800);
 }
 
-// size of one video frame (thresholds are relative to it, also on the stitched wall)
-const frameMin = () => (job.pano ? Math.min(job.frame_h || job.height, job.frame_w || job.width) : Math.min(job.width, job.height));
+const frameMin = () => Math.min(job.width, job.height);
 
 function tagHold(pt) {
   let hit = holds.find((h) => inside(h, pt));
@@ -341,11 +397,11 @@ function tagHold(pt) {
     if (edgeDistance(near, pt) <= 0.04 * frameMin()) hit = near;
   }
   if (!hit) { flash("No hold there. Click inside an outline."); return; }
-  const p = inside(hit, hit.center) ? hit.center : pt;
+  const p = [...(inside(hit, hit.center) ? hit.center : pt), P.frame];
   if (tag === "start") {
     history.push(["starts", P.starts.slice()]);
-    const same = P.starts.filter((s) => inside(hit, s));
-    if (same.length) P.starts = P.starts.filter((s) => !inside(hit, s));   // click again to untag
+    const same = hit.start_idx || [];              // start clicks on this hold, from any frame
+    if (same.length) P.starts = P.starts.filter((_, k) => !same.includes(k));   // click again to untag
     else { P.starts.push(p); if (P.starts.length > 2) P.starts.shift(); }
   } else {
     history.push(["end", P.end]);
@@ -356,7 +412,7 @@ function tagHold(pt) {
 
 function finishPoly() {
   if (poly.length >= 3) {
-    P.vols_manual.push({ kind: "poly", points: poly.slice() });
+    P.vols_manual.push({ kind: "poly", points: poly.slice(), frame: P.frame });
     history.push("vol_manual");
   }
   poly = [];
@@ -365,6 +421,7 @@ function finishPoly() {
 }
 
 function onClick(pt, right) {
+  pinFrame();
   if (!right && tag === "poly") {
     if (poly.length >= 3 && Math.hypot(pt[0] - poly[0][0], pt[1] - poly[0][1]) < 18 / view.s) return finishPoly();
     poly.push(pt); updateStatus(); draw(); return;
@@ -383,12 +440,12 @@ function onClick(pt, right) {
       history.push(["unmanual", P.manual[m.manual_index], m.manual_index]);
       P.manual.splice(m.manual_index, 1);
     } else if (holds.some((h) => inside(h, pt))) {
-      P.deleted.push(pt); history.push("deleted");
+      P.deleted.push([...pt, P.frame]); history.push("deleted");
     } else if (mv) {
       history.push(["unvol", P.vols_manual[mv.manual_index], mv.manual_index]);
       P.vols_manual.splice(mv.manual_index, 1);
     } else if (vols.some((v) => inside(v, pt))) {
-      P.vols_deleted.push(pt); history.push("vol_deleted");
+      P.vols_deleted.push([...pt, P.frame]); history.push("vol_deleted");
     } else { flash("Nothing to delete there."); return; }
   }
   refreshRoute();
@@ -406,12 +463,14 @@ function undo() {
   else if (last[0] === "end") P.end = last[1];
   else if (last[0] === "unmanual") P.manual.splice(last[2], 0, last[1]);
   else if (last[0] === "unvol") P.vols_manual.splice(last[2], 0, last[1]);
+  renderStrip();
   refreshRoute();
 }
 
 function clearAll() {
   Object.assign(P, { auto: [], manual: [], deleted: [], starts: [], end: null, vols_manual: [], vols_deleted: [] });
   history = []; poly = []; setTag(null);
+  renderStrip();
   refreshRoute();
 }
 
@@ -437,6 +496,7 @@ function refreshRoute() {
       }
       holds = data.holds; vols = data.volumes; skippedVols = data.skipped_volumes;
       updateStatus(); draw();
+      if (P.frames) renderStrip();                 // a frame's × hides once it has marks
     } catch (e) { flash(e.message); }
   }, 60);
 }
@@ -525,8 +585,9 @@ $("frame").addEventListener("input", (e) => {
   const i = +e.target.value;
   updateFrameLabel(i);
   clearTimeout(frameTimer);
-  frameTimer = setTimeout(() => loadPicture(i, false), 120);
+  frameTimer = setTimeout(() => goToFrame(i), 120);
 });
+$("add-frame").addEventListener("click", pinFrame);
 $("tol").addEventListener("input", (e) => { P.tol = +e.target.value; $("tol-label").textContent = P.tol; refreshRoute(); });
 $("minsize").addEventListener("input", (e) => { P.min_size = +e.target.value; $("minsize-label").textContent = P.min_size; refreshRoute(); });
 
@@ -545,6 +606,7 @@ document.addEventListener("keydown", (e) => {
   else if (k === "+" || k === "=") zoomAt(1.25);
   else if (k === "-" || k === "_") zoomAt(1 / 1.25);
   else if (k === "0") { fitView(); draw(); }
+  else if (k === "[" || k === "]") stepKeyframe(k === "]" ? 1 : -1);
   else if (k === "enter" && tag === "poly") finishPoly();
   else if (k === "enter" && holds.length) analyze(true);
   else return;
