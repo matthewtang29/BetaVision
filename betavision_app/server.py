@@ -3,7 +3,7 @@ server.py - the local web server (FastAPI). Serves the single page in static/
 and a small JSON API:
 
   POST /api/upload                    upload a video, then follow the camera in the background
-  GET  /api/jobs/{id}/frame/{i}       the picker's picture as JPEG: frame i, or the stitched wall
+  GET  /api/jobs/{id}/frame/{i}       frame i as JPEG for the picker (?w=240 for a thumbnail)
   POST /api/jobs/{id}/holds           picker state -> detected holds + volumes (preview)
   POST /api/jobs/{id}/start           start the analysis in the background
   GET  /api/jobs/{id}                 status / progress / results (the page polls this)
@@ -58,8 +58,8 @@ def upload(file: UploadFile = File(...), still: bool = Form(False)):
 
 
 @app.get("/api/jobs/{job_id}/frame/{i}")
-def frame(job_id: str, i: int):
-    data = get_job(job_id).picture_jpeg(i)
+def frame(job_id: str, i: int, w: int | None = None):
+    data = get_job(job_id).picture_jpeg(i, w)
     if data is None:
         raise HTTPException(404, "Frame not found")
     return Response(data, media_type="image/jpeg", headers={"Cache-Control": "max-age=3600"})
