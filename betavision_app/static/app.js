@@ -15,10 +15,33 @@ let mode = "AUTO", tag = null, poly = [], history = [];
 let img = new Image(), view = { s: 1, ox: 0, oy: 0, fit: 1 };
 let pollTimer = null, jobId = null;
 
-function show(step) {
+const STEP_NUM = { "step-upload": 1, "step-holds": 2, "step-results": 3 };
+
+function show(step, num) {
   STEPS.forEach((s) => ($(s).hidden = s !== step));
+  setSteps(num || STEP_NUM[step]);
   window.scrollTo({ top: 0 });
 }
+
+// header step indicator: earlier steps get a tick, the current one is filled
+function setSteps(n) {
+  if (!n) return;
+  document.querySelectorAll(".steps .step").forEach((el) => {
+    const i = +el.dataset.step;
+    el.classList.toggle("done", i < n);
+    el.classList.toggle("current", i === n);
+  });
+  document.querySelectorAll(".steps .dash").forEach((el) => el.classList.toggle("done", +el.dataset.after < n));
+}
+setSteps(1);
+
+// light / dark toggle; with no saved choice the page follows the system setting
+$("theme").addEventListener("click", () => {
+  const root = document.documentElement;
+  const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  root.dataset.theme = dark ? "light" : "dark";
+  try { localStorage.setItem("bv-theme", root.dataset.theme); } catch (_) { /* storage blocked */ }
+});
 
 async function api(path, body) {
   const r = await fetch(path, body === undefined ? {} : {
@@ -80,7 +103,7 @@ function upload(file) {
     jobId = data.id;
     $("video-name").textContent = file.name;
     $("video-name").title = file.name;
-    startPolling("Reading the wall…");
+    startPolling("Reading the wall…", 1);
   };
   xhr.onerror = () => uploadFailed("Lost connection to BetaVision. Is its window still open?");
   xhr.send(form);
@@ -108,12 +131,12 @@ const STAGES = {
   lock: "Locking holds", track: "Tracking", draw: "Drawing", encode: "Encoding",
 };
 
-function startPolling(title) {
+function startPolling(title, step) {
   $("run-title").textContent = title;
   $("run-message").textContent = "";
   $("run-stage").textContent = "Starting";
   setBar("run", 0);
-  show("step-run");
+  show("step-run", step);
   clearInterval(pollTimer);
   pollTimer = setInterval(poll, 600);
 }
@@ -260,7 +283,7 @@ function draw() {
   }
   // labels in screen pixels so they stay readable at any zoom
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.font = "600 12px Inter, Segoe UI, system-ui, sans-serif";
+  ctx.font = "700 12px Manrope, Segoe UI, system-ui, sans-serif";
   ctx.lineWidth = 3;
   ctx.strokeStyle = "rgba(0,0,0,0.75)";
   const label = (text, x, y, color) => {
@@ -543,7 +566,7 @@ async function analyze(withHolds) {
     else flash(e.message);
     return;
   }
-  startPolling("Reading the beta…");
+  startPolling("Reading the beta…", 3);
 }
 
 // ------------------------------------------------------------------ 4. results
@@ -578,15 +601,17 @@ function showResults(r) {
   const seek = (t) => { player.currentTime = t; player.play(); };
   const moves = $("moves");
   moves.innerHTML = r.moves.length ? r.moves.map((m, i) =>
-    `<li data-i="${i}"><span class="t">${fmt(m.t)}</span>` +
-    `<span>${esc(m.limb)} on ${m.volume ? "volume" : "hold"} ${esc(m.hold)}${m.role ? `<span class="role">${esc(m.role)}</span>` : ""}</span>` +
-    `<span class="d">${fmt(m.dur)}</span></li>`).join("")
+    `<li data-i="${i}"><span class="n">${i + 1}</span>` +
+    `<span class="what"><span>${esc(m.limb)} on ${m.volume ? "volume" : "hold"} ${esc(m.hold)}${m.role ? `<span class="role">${esc(m.role)}</span>` : ""}</span>` +
+    `<span class="t">[${fmt(m.t)}]</span></span><span class="d">${fmt(m.dur)}</span></li>`).join("")
     : `<li class="empty">${r.holds_total ? "No hand or foot stayed on a marked hold long enough to count." : "No holds were marked, so there's no hold sequence."}</li>`;
+  $("moves-count").textContent = r.moves.length ? `${r.moves.length} move${r.moves.length === 1 ? "" : "s"}` : "";
   moves.querySelectorAll("li[data-i]").forEach((li) => li.addEventListener("click", () => seek(r.moves[+li.dataset.i].t)));
 
   $("notes-block").hidden = !r.notes.length;
   $("notes-list").innerHTML = r.notes.map((n, i) =>
-    `<li data-i="${i}"><span class="t">${fmt(n.start)}</span><span>${esc(n.text)}</span><span class="d">${esc(n.to)}</span></li>`).join("");
+    `<li data-i="${i}"><span class="n">${i + 1}</span><span class="what"><span>${esc(n.text)}</span>` +
+    `<span class="t">[${fmt(n.start)}] · ${esc(n.to)}</span></span></li>`).join("");
   $("notes-list").querySelectorAll("li").forEach((li) => li.addEventListener("click", () => seek(r.notes[+li.dataset.i].start)));
 
   $("angles").innerHTML = r.angles.length
