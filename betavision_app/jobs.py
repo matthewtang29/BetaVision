@@ -28,7 +28,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
-import imageio_ffmpeg
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -372,10 +371,46 @@ def summarize(job, res, holds, vols):
 
 
 def to_h264(src, dst):
-    """OpenCV writes mp4v, which browsers won't play. Re-encode with the ffmpeg
-    that ships inside the imageio-ffmpeg wheel (nothing to install separately)."""
+    """OpenCV writes mp4v, which browsers won't play, so re-encode to H.264.
+    On Windows this uses Windows' own encoder (Media Foundation): the ffmpeg.exe in the
+    imageio-ffmpeg wheel is unsigned, and Smart App Control blocks it on some PCs."""
+    if sys.platform == "win32":
+        try:
+            _h264_media_foundation(src, dst)
+            return
+        except Exception as e:
+            print(f"Windows H.264 encoder failed ({e}), trying ffmpeg instead")
+    _h264_ffmpeg(src, dst)
+
+
+def _h264_media_foundation(src, dst):
+    cap = cv2.VideoCapture(str(src))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) // 2 * 2                  # H.264 4:2:0 needs even sizes
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) // 2 * 2
+    out = cv2.VideoWriter(str(dst), cv2.CAP_MSMF, cv2.VideoWriter_fourcc(*"H264"), fps, (w, h))
+    try:
+        if not out.isOpened():
+            raise RuntimeError("Media Foundation H.264 writer didn't open")
+        n = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            out.write(frame[:h, :w])
+            n += 1
+        if n == 0:
+            raise RuntimeError("no frames to encode")
+    finally:
+        cap.release()
+        out.release()
+
+
+def _h264_ffmpeg(src, dst):
+    """The ffmpeg that ships inside the imageio-ffmpeg wheel (nothing to install separately)."""
+    import imageio_ffmpeg
     cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error", "-i", str(src),
-           "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",          # H.264 4:2:0 needs even sizes
+           "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
            "-movflags", "+faststart", "-an", str(dst)]
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)          # no console flash on Windows
@@ -424,7 +459,13 @@ class Worker:
                 self._run(job)
             except Exception as e:                      # show the error on the page, keep the server alive
                 traceback.print_exc()
-                job.state, job.message = "error", f"Analysis failed: {e}"
+                if getattr(e, "winerror", None) == 4551:    # Smart App Control / App Control for Business
+                    msg = (f"Windows blocked a file BetaVision needs, during \"{job.message}\""
+                           + (f" ({Path(e.filename).name})" if getattr(e, "filename", None) else "")
+                           + ". The console window has the details.")
+                else:
+                    msg = f"Analysis failed: {e}"
+                job.state, job.message = "error", msg
 
     def _run(self, job):
         job.state = "running"
