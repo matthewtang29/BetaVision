@@ -3,8 +3,17 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>BetaVision</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M3.5 12.5c-.6-4.6 2.8-8.6 7.2-9 3.6-.3 7.6 1.6 9 5 1.5 3.8-.6 8.4-4.6 10-4.8 1.9-11 .1-11.6-6z' fill='%231D1F1C'/%3E%3Ccircle cx='11.5' cy='10.5' r='1.6' fill='%23F7F5F0'/%3E%3C/svg%3E">
+<title>BetaVision · climbing video analyzer</title>
+<meta name="description" content="Analyze your rock climbing videos on your own computer: mark the route, track your body hold by hold, and read your beta.">
+<meta name="theme-color" content="#f7f5f0" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#14161a" media="(prefers-color-scheme: dark)">
+<meta property="og:type" content="website">
+<meta property="og:title" content="BetaVision">
+<meta property="og:description" content="Computer-vision analysis of rock climbing videos. Runs locally: your videos never leave your computer.">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="icon" href="icons/icon-192.png" type="image/png" sizes="192x192">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="manifest" href="manifest.webmanifest">
 <script>
   // apply the saved light/dark choice before the page paints
   try { const t = localStorage.getItem("bv-theme"); if (t) document.documentElement.dataset.theme = t; } catch (_) { /* storage blocked */ }
@@ -28,7 +37,7 @@
   </div>
   <div class="head-right">
     <nav class="steps" aria-label="Steps">
-      <span class="step" data-step="1"><span class="num">1</span><span class="label">Upload</span></span>
+      <span class="step current" data-step="1" aria-current="step"><span class="num">1</span><span class="label">Upload</span></span>
       <span class="dash" data-after="1"></span>
       <span class="step" data-step="2"><span class="num">2</span><span class="label">Mark route</span></span>
       <span class="dash" data-after="2"></span>
@@ -52,11 +61,11 @@
 
     <div class="upload-grid">
       <div class="upload-col">
-        <label id="drop" class="drop" tabindex="0">
-          <input id="file" type="file" accept=".mp4,.mov,.avi,video/mp4,video/quicktime,video/x-msvideo" hidden>
+        <label id="drop" class="drop" tabindex="0" aria-describedby="privacy-note">
+          <input id="file" type="file" accept=".mp4,.mov,.m4v,.avi,video/mp4,video/quicktime,video/x-m4v,video/x-msvideo" hidden>
           <span class="drop-top">
             <svg class="drop-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 12.5c-.6-4.6 2.8-8.6 7.2-9 3.6-.3 7.6 1.6 9 5 1.5 3.8-.6 8.4-4.6 10-4.8 1.9-11 .1-11.6-6z"/><circle cx="11.5" cy="10.5" r="1.6"/></svg>
-            <span class="mono small-mono">MP4 · MOV · AVI</span>
+            <span class="mono small-mono">MP4 · MOV · AVI · up to 10 min</span>
           </span>
           <span class="drop-text">
             <span class="drop-title">Your climb</span>
@@ -65,11 +74,11 @@
           <span class="btn primary">Choose file</span>
         </label>
         <label class="check" id="still-row"><input type="checkbox" id="still"> Filmed on a tripod (skip camera tracking)</label>
-        <div id="upload-progress" class="panel progress-panel" hidden>
+        <div id="upload-progress" class="panel progress-panel" role="status" aria-live="polite" hidden>
           <div class="progress-label"><span id="upload-label">Uploading…</span><span id="upload-pct">0%</span></div>
-          <div class="bar"><div id="upload-bar"></div></div>
+          <div class="bar" role="progressbar" aria-labelledby="upload-label" aria-valuemin="0" aria-valuemax="100"><div id="upload-bar"></div></div>
         </div>
-        <p id="upload-error" class="error" hidden></p>
+        <p id="upload-error" class="error" role="alert" hidden></p>
       </div>
 
       <ol class="how panel">
@@ -95,12 +104,12 @@
           <span id="video-name" class="mono meta"></span>
         </div>
         <div class="canvas-wrap">
-          <canvas id="canvas"></canvas>
-          <div id="canvas-msg" class="canvas-msg" hidden></div>
+          <canvas id="canvas" role="img" aria-label="A frame of your video. Click a hold to mark it; the outlines show the route found so far."></canvas>
+          <div id="canvas-msg" class="canvas-msg" role="status" aria-live="polite" hidden></div>
           <div class="zoom">
-            <button class="round-btn small" id="zoom-in" title="Zoom in (+)">+</button>
-            <button class="round-btn small" id="zoom-out" title="Zoom out (−)">−</button>
-            <button class="round-btn small" id="zoom-fit" title="Fit (0)">⤢</button>
+            <button class="round-btn small" id="zoom-in" title="Zoom in (+)" aria-label="Zoom in">+</button>
+            <button class="round-btn small" id="zoom-out" title="Zoom out (−)" aria-label="Zoom out">−</button>
+            <button class="round-btn small" id="zoom-fit" title="Fit (0)" aria-label="Fit the picture">⤢</button>
           </div>
         </div>
         <p class="hint small">Right-click a wrong hold or volume to remove it. Scroll to zoom, drag to move.</p>
@@ -141,23 +150,23 @@
         </div>
         <div class="field">
           <span class="field-label">Click mode <kbd>M</kbd></span>
-          <div class="seg" role="radiogroup">
-            <button data-mode="AUTO" class="on" title="Click a hold: every hold of that colour is found">All of this colour</button>
-            <button data-mode="MANUAL" title="Click a hold: only that hold is added">Just this hold</button>
+          <div class="seg" role="radiogroup" aria-label="Click mode">
+            <button data-mode="AUTO" class="on" role="radio" aria-checked="true" title="Click a hold: every hold of that colour is found">All of this colour</button>
+            <button data-mode="MANUAL" role="radio" aria-checked="false" title="Click a hold: only that hold is added">Just this hold</button>
           </div>
         </div>
         <div class="field">
           <span class="field-label">Tag holds</span>
           <div class="chips">
-            <button id="tag-start" class="chip"><i class="dot start"></i>Start <kbd>S</kbd></button>
-            <button id="tag-end" class="chip"><i class="dot end"></i>End <kbd>E</kbd></button>
+            <button id="tag-start" class="chip" aria-pressed="false"><i class="dot start"></i>Start <kbd>S</kbd></button>
+            <button id="tag-end" class="chip" aria-pressed="false"><i class="dot end"></i>End <kbd>E</kbd></button>
           </div>
         </div>
         <div class="field">
           <span class="field-label">Volumes <span class="muted">grey ones are found for you</span></span>
           <div class="chips">
-            <button id="tag-volume" class="chip" title="Next click outlines a volume the auto-detect missed">Add by click <kbd>V</kbd></button>
-            <button id="tag-poly" class="chip" title="Click the volume's corners; click the first corner again or press Enter to finish">Trace corners <kbd>P</kbd></button>
+            <button id="tag-volume" class="chip" aria-pressed="false" title="Next click outlines a volume the auto-detect missed">Add by click <kbd>V</kbd></button>
+            <button id="tag-poly" class="chip" aria-pressed="false" title="Click the volume's corners; click the first corner again or press Enter to finish">Trace corners <kbd>P</kbd></button>
           </div>
         </div>
         <div class="field">
@@ -174,8 +183,8 @@
         </div>
 
         <div class="status-box">
-          <div id="mode-status" class="now"></div>
-          <div class="kv"><span>Holds on route</span><span id="n-holds">0 holds</span></div>
+          <div id="mode-status" class="now" aria-live="polite"></div>
+          <div class="kv"><span>Holds on route</span><span id="n-holds" aria-live="polite">0 holds</span></div>
           <div class="kv"><span>Start / end</span><span><span id="n-start">Start 0/2</span> · <span id="n-end">End —</span></span></div>
           <div class="kv"><span>Volumes</span><span id="n-vols">0 volumes</span></div>
           <div class="kv cuts"><span></span><span id="n-cuts"></span></div>
@@ -202,12 +211,12 @@
   <section id="step-run" class="panel center" hidden>
     <div class="spinner" aria-hidden="true"></div>
     <h2 id="run-title">Reading the beta…</h2>
-    <p id="run-message" class="hint"></p>
+    <p id="run-message" class="hint" role="status" aria-live="polite"></p>
     <div class="progress-block">
       <div class="progress-label"><span id="run-stage">Tracking</span><span id="run-pct">0%</span></div>
-      <div class="bar"><div id="run-bar"></div></div>
+      <div class="bar" role="progressbar" aria-labelledby="run-stage" aria-valuemin="0" aria-valuemax="100"><div id="run-bar"></div></div>
     </div>
-    <p class="hint small">This runs on your computer. Longer or high-resolution videos take a while.</p>
+    <p class="hint small">This runs on your computer, so nothing is uploaded anywhere. Longer or high-resolution videos take a while.</p>
   </section>
 
   <!-- 4. results -->
@@ -241,18 +250,20 @@
           <a id="download" class="btn primary" download>Download video</a>
         </div>
         <a id="csv" class="btn link" download>Frame-by-frame data (CSV)</a>
+        <button id="delete" class="btn link muted-link">Delete this video from my computer</button>
+        <p id="delete-note" class="error small" role="alert" hidden></p>
       </aside>
     </div>
   </section>
 
   <section id="step-error" class="panel center" hidden>
     <h2>That one didn't go</h2>
-    <p id="error-message" class="error"></p>
+    <p id="error-message" class="error" role="alert"></p>
     <button id="restart-3" class="btn outline">Start over</button>
   </section>
 </main>
 
-<footer class="site">Everything stays on this computer. Videos are cleared the next time BetaVision starts.</footer>
+<footer class="site" id="privacy-note">Everything stays on this computer: your video is never uploaded to the internet. Videos are deleted when you press Delete, or the next time BetaVision starts.</footer>
 <script src="app.js"></script>
 </body>
 </html>

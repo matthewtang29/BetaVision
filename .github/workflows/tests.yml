@@ -1,0 +1,47 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: System libraries for OpenCV / MediaPipe
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgl1 libegl1 libgles2
+      - run: pip install -r requirements.txt pytest httpx
+      - run: python -m pytest -q tests
+
+  windows-launcher:
+    # run_betavision.bat: first run installs into %LOCALAPPDATA%\BetaVision and adds the
+    # Start menu shortcut; a second run must reuse that install without reinstalling.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: First run sets up
+        shell: cmd
+        run: run_betavision.bat --setup
+      - name: Second run reuses the install
+        shell: pwsh
+        run: |
+          $out = cmd /c "run_betavision.bat --setup" | Out-String
+          Write-Output $out
+          if ($out -match "Installing") { throw "reinstalled although requirements.txt didn't change" }
+          $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'BetaVision.lnk'
+          if (-not (Test-Path $lnk)) { throw "no Start menu shortcut at $lnk" }
+          & "$env:LOCALAPPDATA\BetaVision\venv\Scripts\python.exe" -c "import betavision_app.server; print('imports ok')"

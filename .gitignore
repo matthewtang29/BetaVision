@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# BetaVision's own output: uploads + results of the web app, and your climbs
+workspace/
+*.mp4
+*.mov
+*.MOV
+*.m4v
+*.avi
+*_holds.json
+*_holds.png
+*_notes.txt
+*_analysis.csv
+*_pose.csv
+*.task
+*.part
+
+# the README demo video is kept on purpose
+!docs/demo.mp4
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -13,7 +13,9 @@
   --contour: #e6e1d6;
   --on-ink: #f7f5f0;
   --soft: #e3dfd6;
-  --you: #e07a2e;              /* the one warm accent, as in the mockup */
+  --you: #e07a2e;              /* the one accent: only on the primary action of each screen */
+  --on-you: #1d1f1c;           /* ink on the accent (5.5:1); white would be 3.0:1 */
+  --you-hover: #cc6a20;
   --danger: #b0432f;
   --shadow: 0 1px 2px rgba(29, 31, 28, 0.04);
   --sun: none; --moon: block;
@@ -23,13 +25,13 @@
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --bg: #14161a; --surface: #1c1f24; --ink: #eceae4; --muted: #a3a69f; --line: #2c3037; --dash: #4a4f57;
-    --wall: #22262c; --contour: #1e2126; --on-ink: #14161a; --soft: #2c3037; --you: #f0904a; --danger: #ec8e7c;
+    --wall: #22262c; --contour: #1e2126; --on-ink: #14161a; --soft: #2c3037; --you: #f0904a; --on-you: #14161a; --you-hover: #f5a466; --danger: #ec8e7c;
     --shadow: none; --sun: block; --moon: none; color-scheme: dark;
   }
 }
 :root[data-theme="dark"] {
   --bg: #14161a; --surface: #1c1f24; --ink: #eceae4; --muted: #a3a69f; --line: #2c3037; --dash: #4a4f57;
-  --wall: #22262c; --contour: #1e2126; --on-ink: #14161a; --soft: #2c3037; --you: #f0904a; --danger: #ec8e7c;
+  --wall: #22262c; --contour: #1e2126; --on-ink: #14161a; --soft: #2c3037; --you: #f0904a; --on-you: #14161a; --you-hover: #f5a466; --danger: #ec8e7c;
   --shadow: none; --sun: block; --moon: none; color-scheme: dark;
 }
 
@@ -89,6 +91,9 @@ h2 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -0.01em; }
 .mono { font-family: var(--mono); }
 .meta { font-size: 12px; color: var(--muted); max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .error { color: var(--danger); margin: 14px 0 0; }
+.error.ok { color: var(--ink); }
+:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.moves li:focus-visible { outline-offset: -2px; }
 .page-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px 16px; flex-wrap: wrap; margin-bottom: 14px; }
 .section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
 
@@ -112,7 +117,7 @@ h2 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -0.01em; }
 .drop.over { background: var(--wall); }
 .drop-top { display: flex; align-items: center; justify-content: space-between; width: 100%; }
 .drop-icon { width: 40px; height: 40px; }
-.drop-icon path { fill: var(--you); }
+.drop-icon path { fill: var(--ink); }
 .drop-icon circle { fill: var(--surface); }
 .small-mono { font-size: 11px; color: var(--muted); }
 .drop-text { display: flex; flex-direction: column; gap: 6px; }
@@ -144,8 +149,9 @@ h2 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -0.01em; }
   border: 1.5px solid transparent; display: inline-flex; align-items: center; justify-content: center; gap: 8px;
   text-decoration: none; color: inherit; background: none; transition: background .15s, border-color .15s, color .15s, opacity .15s;
 }
-.btn.primary { background: var(--ink); color: var(--on-ink); }
-.btn.primary:hover { opacity: .88; }
+.btn.primary { background: var(--you); color: var(--on-you); }
+.btn.primary:hover { background: var(--you-hover); }
+.drop:hover .btn.primary { background: var(--you-hover); }
 .btn.outline { border-color: var(--ink); color: var(--ink); }
 .btn.outline:hover { background: var(--wall); }
 .btn.block { width: 100%; min-height: 48px; font-size: 15px; }
@@ -155,7 +161,7 @@ h2 { margin: 0; font-size: 18px; font-weight: 700; letter-spacing: -0.01em; }
 .btn:disabled { opacity: .4; cursor: default; }
 .arrow { width: 16px; height: 16px; stroke: currentColor; }
 kbd { font: 11px/1 var(--mono); padding: 2px 5px; border-radius: 4px; border: 1px solid var(--line); color: var(--muted); background: var(--bg); }
-.btn.primary kbd { background: transparent; border-color: color-mix(in srgb, var(--on-ink) 35%, transparent); color: var(--on-ink); opacity: .75; }
+.btn.primary kbd { background: transparent; border-color: color-mix(in srgb, var(--on-you) 35%, transparent); color: var(--on-you); opacity: .75; }
 select { font: inherit; font-size: 14px; color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; width: 100%; }
 input[type=range] { width: 100%; accent-color: var(--ink); }
 textarea { font: 13px/1.5 var(--mono); color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; resize: vertical; width: 100%; }
@@ -192,7 +198,7 @@ code { font: 12px var(--mono); background: var(--wall); border-radius: 4px; padd
 .dot.start, .sw.start { background: #1fb8c9; }
 .dot.end, .sw.end { background: #d0473b; }
 .sw.auto { background: #3fae5a; }
-.sw.manual { background: #e38b2c; }
+.sw.manual { background: #9b6bd6; }
 .sw.vol { background: #d9d6cf; box-shadow: 0 0 0 1px #6b675f; }
 .sw.cut { background: #ff69b4; }
 .status-box { display: flex; flex-direction: column; gap: 8px; padding-top: 16px; border-top: 1px solid var(--line); font: 12px var(--mono); color: var(--muted); }
@@ -228,7 +234,6 @@ code { font: 12px var(--mono); background: var(--wall); border-radius: 4px; padd
 .stat .v { font-size: 24px; font-weight: 800; letter-spacing: -0.02em; }
 .stat .k { font-size: 13px; color: var(--muted); }
 .stat.topped { border: 1.5px solid var(--ink); }
-.stat.topped .v { color: var(--you); }
 .angles-panel { display: flex; flex-direction: column; gap: 6px; }
 .moves { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; max-height: 520px; overflow: auto; }
 .moves li { display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: center; padding: 12px 14px; font-size: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); cursor: pointer; transition: border-color .15s; }
@@ -250,7 +255,8 @@ code { font: 12px var(--mono); background: var(--wall); border-radius: 4px; padd
 .angles th { font: 500 11.5px var(--mono); color: var(--muted); }
 .side-actions { display: flex; gap: 10px; flex-wrap: wrap; padding-top: 6px; }
 .side-actions .btn { flex: 1 1 120px; min-height: 48px; }
-#csv { align-self: center; }
+#csv, #delete { align-self: center; }
+#delete { font-size: 13px; }
 
 @media (max-width: 900px) {
   /* on narrow screens the route tools come straight after the picture, the extra options after them */

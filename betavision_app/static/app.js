@@ -5,8 +5,10 @@
 
 const $ = (id) => document.getElementById(id);
 const STEPS = ["step-upload", "step-holds", "step-run", "step-results", "step-error"];
-const VIDEO_EXT = [".mp4", ".mov", ".avi"];
-const COLORS = { auto: "#3fae5a", manual: "#e38b2c", start: "#1fb8c9", end: "#d0473b", vol: "#ebebeb", cut: "#ff69b4" };
+const VIDEO_EXT = [".mp4", ".mov", ".m4v", ".avi"];
+let limits = { max_upload_mb: 2048, max_minutes: 10 };   // replaced by the server's own limits below
+fetch("/api/limits").then((r) => r.json()).then((l) => (limits = l)).catch(() => {});
+const COLORS = { auto: "#3fae5a", manual: "#9b6bd6", start: "#1fb8c9", end: "#d0473b", vol: "#ebebeb", cut: "#ff69b4" };
 
 let job = null;          // {id, name, frames, fps, width, height, keyframes, camera_moved}
 let P = null;            // picker state sent to the server (see jobs.Job.build_route)
@@ -30,6 +32,7 @@ function setSteps(n) {
     const i = +el.dataset.step;
     el.classList.toggle("done", i < n);
     el.classList.toggle("current", i === n);
+    if (i === n) el.setAttribute("aria-current", "step"); else el.removeAttribute("aria-current");
   });
   document.querySelectorAll(".steps .dash").forEach((el) => el.classList.toggle("done", +el.dataset.after < n));
 }
@@ -76,8 +79,15 @@ fileInput.addEventListener("change", () => { if (fileInput.files[0]) upload(file
 function upload(file) {
   const err = $("upload-error");
   err.hidden = true;
+  err.classList.remove("ok");
   if (!VIDEO_EXT.some((x) => file.name.toLowerCase().endsWith(x))) {
-    err.textContent = "That isn't a video BetaVision can read. Choose an .mp4, .mov or .avi file.";
+    err.textContent = "That isn't a video BetaVision can read. Choose an .mp4, .mov, .m4v or .avi file.";
+    err.hidden = false;
+    return;
+  }
+  if (file.size > limits.max_upload_mb * 1024 * 1024) {
+    err.textContent = `That video is ${(file.size / 1024 ** 3).toFixed(1)} GB. BetaVision takes up to ` +
+      `${limits.max_upload_mb / 1024} GB: trim it to the climb, or export it at 1080p.`;
     err.hidden = false;
     return;
   }
@@ -105,7 +115,7 @@ function upload(file) {
     $("video-name").title = file.name;
     startPolling("Reading the wall…", 1);
   };
-  xhr.onerror = () => uploadFailed("Lost connection to BetaVision. Is its window still open?");
+  xhr.onerror = () => uploadFailed("Lost connection to BetaVision. Is it still running?");
   xhr.send(form);
 }
 
@@ -121,6 +131,7 @@ function uploadFailed(msg) {
 function setBar(which, f, label) {
   const pct = Math.round(Math.max(0, Math.min(1, f)) * 100);
   $(`${which}-bar`).style.width = pct + "%";
+  $(`${which}-bar`).parentElement.setAttribute("aria-valuenow", pct);
   $(`${which}-pct`).textContent = pct + "%";
   if (label !== undefined) $(`${which}-label`).textContent = label;
 }
@@ -503,7 +514,10 @@ function refreshRoute() {
 
 function setMode(m) {
   mode = m;
-  document.querySelectorAll(".seg button").forEach((b) => b.classList.toggle("on", b.dataset.mode === m));
+  document.querySelectorAll(".seg button").forEach((b) => {
+    b.classList.toggle("on", b.dataset.mode === m);
+    b.setAttribute("aria-checked", b.dataset.mode === m ? "true" : "false");
+  });
   setTag(null);
 }
 
@@ -512,6 +526,7 @@ function setTag(t) {
   tag = t;
   for (const [id, name] of [["tag-start", "start"], ["tag-end", "end"], ["tag-volume", "volume"], ["tag-poly", "poly"]]) {
     $(id).classList.toggle("on", t === name);
+    $(id).setAttribute("aria-pressed", t === name ? "true" : "false");
   }
   updateStatus();
   draw();
@@ -640,6 +655,12 @@ function stat(value, label, cls) {
 
 function esc(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 
+// a clickable row that also works from the keyboard (Enter / Space)
+function onActivate(el, fn) {
+  el.addEventListener("click", fn);
+  el.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fn(); } });
+}
+
 function showResults(r) {
   const player = $("player");
   player.hidden = false;
@@ -663,18 +684,18 @@ function showResults(r) {
   const seek = (t) => { player.currentTime = t; player.play(); };
   const moves = $("moves");
   moves.innerHTML = r.moves.length ? r.moves.map((m, i) =>
-    `<li data-i="${i}"><span class="n">${i + 1}</span>` +
+    `<li data-i="${i}" tabindex="0" role="button"><span class="n">${i + 1}</span>` +
     `<span class="what"><span>${esc(m.limb)} on ${m.volume ? "volume" : "hold"} ${esc(m.hold)}${m.role ? `<span class="role">${esc(m.role)}</span>` : ""}</span>` +
     `<span class="t">[${fmt(m.t)}]</span></span><span class="d">${fmt(m.dur)}</span></li>`).join("")
     : `<li class="empty">${r.holds_total ? "No hand or foot stayed on a marked hold long enough to count." : "No holds were marked, so there's no hold sequence."}</li>`;
   $("moves-count").textContent = r.moves.length ? `${r.moves.length} move${r.moves.length === 1 ? "" : "s"}` : "";
-  moves.querySelectorAll("li[data-i]").forEach((li) => li.addEventListener("click", () => seek(r.moves[+li.dataset.i].t)));
+  moves.querySelectorAll("li[data-i]").forEach((li) => onActivate(li, () => seek(r.moves[+li.dataset.i].t)));
 
   $("notes-block").hidden = !r.notes.length;
   $("notes-list").innerHTML = r.notes.map((n, i) =>
-    `<li data-i="${i}"><span class="n">${i + 1}</span><span class="what"><span>${esc(n.text)}</span>` +
+    `<li data-i="${i}" tabindex="0" role="button"><span class="n">${i + 1}</span><span class="what"><span>${esc(n.text)}</span>` +
     `<span class="t">[${fmt(n.start)}] · ${esc(n.to)}</span></span></li>`).join("");
-  $("notes-list").querySelectorAll("li").forEach((li) => li.addEventListener("click", () => seek(r.notes[+li.dataset.i].start)));
+  $("notes-list").querySelectorAll("li").forEach((li) => onActivate(li, () => seek(r.notes[+li.dataset.i].start)));
 
   $("angles").innerHTML = r.angles.length
     ? "<tr><th>Joint</th><th>Most bent</th><th>Typical</th><th>Straightest</th></tr>" +
@@ -694,6 +715,25 @@ function restart() {
   $("still-row").hidden = false;
   $("upload-progress").hidden = true;
   $("upload-error").hidden = true;
+  $("upload-error").classList.remove("ok");
+  $("delete-note").hidden = true;
   show("step-upload");
 }
 ["restart-1", "restart-2", "restart-3"].forEach((id) => $(id).addEventListener("click", restart));
+
+// delete this video and its results from the computer now (instead of the next time BetaVision starts)
+$("delete").addEventListener("click", async () => {
+  if (!jobId || !confirm("Delete this video and its analysis from this computer? Download anything you want to keep first.")) return;
+  try {
+    await fetch(`/api/jobs/${jobId}`, { method: "DELETE" }).then((r) => { if (!r.ok && r.status !== 404) throw new Error(); });
+    restart();
+    $("upload-error").textContent = "Deleted. Nothing from that climb is left on this computer.";
+    $("upload-error").classList.add("ok");
+    $("upload-error").hidden = false;
+  } catch (_) { flashResult("Couldn't delete it. Is BetaVision still running?"); }
+});
+
+function flashResult(msg) { $("delete-note").textContent = msg; $("delete-note").hidden = false; }
+
+// installable app: works like any installed app, and says how to start BetaVision when it isn't running
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
