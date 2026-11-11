@@ -39,8 +39,7 @@
 
 ## Why I built it
 
-<!-- TODO(Matthew): replace this draft with your own 2-3 sentences. -->
-When I climb, I film my attempts to work out what went wrong, but scrubbing through phone videos doesn't show much: it's hard to tell which hold my foot was actually on, or when my hips came away from the wall. I wanted a tool that turns that footage into something I can read, without uploading my videos to someone else's server.
+I built BetaVision because I loved rock climbing with my high school friends, and being able to analyze how I climbed just means faster progress in the gym.
 
 ## How it works
 
