@@ -15,6 +15,7 @@ Nothing here opens an OpenCV window.
 """
 
 import math
+import os
 import queue
 import re
 import shutil
@@ -24,6 +25,7 @@ import sys
 import threading
 import traceback
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -40,7 +42,13 @@ import climb_pose as cp            # noqa: E402
 import climb_volumes as cvol       # noqa: E402
 
 WORKSPACE = ROOT / "workspace"     # uploads + outputs, wiped every time the app starts
-VIDEO_TYPES = {".mp4", ".mov", ".avi"}
+VIDEO_TYPES = {".mp4", ".mov", ".m4v", ".avi"}
+
+# Limits for uploads (override with environment variables if a longer climb needs it).
+MAX_UPLOAD_MB = int(os.environ.get("BETAVISION_MAX_UPLOAD_MB", 2048))     # file size
+MAX_MINUTES = float(os.environ.get("BETAVISION_MAX_MINUTES", 10))         # video length
+MAX_SIDE = int(os.environ.get("BETAVISION_MAX_SIDE", 4096))               # longest side in px (4K phone video fits)
+CACHE_MB = int(os.environ.get("BETAVISION_CACHE_MB", 1024))               # picker cache per video
 LIMB_NAMES = {"l_hand": "Left hand", "r_hand": "Right hand", "l_foot": "Left foot", "r_foot": "Right foot"}
 ANGLE_NAMES = {"elbow": "Elbows", "knee": "Knees", "hip": "Hips"}
 
@@ -61,7 +69,10 @@ class Job:
         self.state, self.stage, self.message, self.progress = "uploading", "", "", 0.0
         self.results = None
         self.lock = threading.Lock()   # cv2.VideoCapture isn't thread-safe
-        self.cache = {}                # picture labs, auto volumes, manual outlines
+        self.cache = OrderedDict()     # picture labs, auto volumes, manual outlines (least recently used first)
+        self.cache_bytes = 0
+        self.cache_lock = threading.Lock()   # keyframes are searched from several threads
+        self.reader = None
         self.cam, self.moved, self.keyframes = None, 0.0, None   # keyframes: set when the camera moved a lot
 
     # ---------------------------------------------------------------- open + follow the camera
@@ -73,6 +84,13 @@ class Job:
             raise ValueError("Couldn't read that video. Try exporting it again as .mp4.")
         self.reader = ch.FrameReader(self.input)
         self.height, self.width = frame.shape[:2]
+        if max(self.width, self.height) > MAX_SIDE:
+            raise ValueError(f"That video is {self.width}x{self.height}. BetaVision handles up to "
+                             f"{MAX_SIDE} px on the longest side (4K). Export it at 4K or 1080p and try again.")
+        minutes = self.reader.total / (self.reader.fps or 30.0) / 60
+        if minutes > MAX_MINUTES:
+            raise ValueError(f"That video is {minutes:.0f} minutes long. BetaVision handles up to "
+                             f"{MAX_MINUTES:g} minutes: trim it to the climb and try again.")
         self.still = still
         self.base = 0 if still else self.reader.total // 2          # same base frame as the CLI
         self.state = "preparing"
@@ -117,7 +135,19 @@ class Job:
     # ---------------------------------------------------------------- the picker's picture
     def frame(self, i):
         with self.lock:
+            if self.reader is None:
+                return None
             return self.reader.read(max(0, min(int(i), self.reader.total - 1)))
+
+    def release(self):
+        """Free the picker's memory and close the video (the files on disk stay)."""
+        with self.cache_lock:
+            self.cache.clear()
+            self.cache_bytes = 0
+        with self.lock:
+            if self.reader is not None:
+                self.reader.cap.release()
+                self.reader = None
 
     def picture_jpeg(self, i, width=None):
         img = self.frame(i)
@@ -128,14 +158,29 @@ class Job:
         return cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 88])[1].tobytes()
 
     def cached(self, key, fn):
-        if key not in self.cache:
-            if len(self.cache) > 400:
-                self.cache.clear()
-            self.cache[key] = fn()
-        return self.cache[key]
+        """Remember results while you mark the route, within CACHE_MB: a 1080p colour
+        picture is ~25 MB, so the oldest ones are dropped as you scrub through the video."""
+        with self.cache_lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+                return self.cache[key]
+        value = fn()                                 # outside the lock: this is the slow part
+        with self.cache_lock:
+            if key not in self.cache:
+                self.cache[key] = value
+                self.cache_bytes += nbytes(value)
+            while self.cache_bytes > CACHE_MB * 1024 * 1024 and len(self.cache) > 1:
+                _, old = self.cache.popitem(last=False)
+                self.cache_bytes -= nbytes(old)
+        return value
 
     def lab(self, i):
-        return self.cached(("lab", int(i)), lambda: ch.to_lab(self.frame(i)))
+        def make():
+            img = self.frame(i)
+            if img is None:
+                raise ValueError(f"Couldn't read frame {int(i)} of the video")
+            return ch.to_lab(img)
+        return self.cached(("lab", int(i)), make)
 
     # ---------------------------------------------------------------- route (same steps as the picker window)
     def build_route(self, st):
@@ -292,7 +337,18 @@ class Job:
     def status(self):
         return {"id": self.id, "state": self.state, "stage": self.stage, "message": self.message,
                 "progress": round(self.progress, 3), "results": self.results,
-                "info": self.info() if self.state == "picking" else None}
+                "info": self.info() if self.state == "picking" and self.reader is not None else None}
+
+
+def nbytes(value):
+    """Rough memory size of a cached value (numpy arrays dominate)."""
+    if isinstance(value, np.ndarray):
+        return value.nbytes
+    if isinstance(value, (list, tuple)):
+        return 1024 + sum(nbytes(v) for v in value)
+    if isinstance(value, dict):
+        return 1024 + sum(nbytes(v) for v in value.values())
+    return 64
 
 
 def center(contour):
@@ -438,9 +494,18 @@ class Worker:
         threading.Thread(target=self._loop, daemon=True).start()
 
     def new_job(self, filename):
+        for old in self.jobs.values():               # only one video is open in the page at a time
+            if old.state not in ("queued", "running"):
+                old.release()
         job = Job(filename)
         self.jobs[job.id] = job
         return job
+
+    def discard(self, job):
+        """Delete a video and everything made from it (failed upload, or the page's Delete button)."""
+        job.release()
+        self.jobs.pop(job.id, None)
+        shutil.rmtree(job.dir, ignore_errors=True)
 
     def start(self, job, picker_state, model, notes, use_lock):
         if picker_state:
