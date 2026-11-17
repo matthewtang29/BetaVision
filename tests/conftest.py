@@ -26,6 +26,12 @@ def video(tmp_path):
     return path
 
 
+@pytest.fixture(autouse=True)
+def library_in_tmp(tmp_path, monkeypatch):
+    """No test may write to (or read) the real ~/.climb_analyzer/library."""
+    monkeypatch.setenv("BETAVISION_LIBRARY", str(tmp_path / "test-library"))
+
+
 @pytest.fixture
 def jobs_mod(tmp_path, monkeypatch):
     from betavision_app import jobs

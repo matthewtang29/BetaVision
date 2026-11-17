@@ -682,7 +682,7 @@ async function analyze(withHolds) {
   try {
     await api(`/api/jobs/${job.id}/start`, {
       picker: withHolds ? P : null, model: $("model").value, notes: $("notes").value, lock: $("lock").checked,
-      off_route: $("offroute").checked,
+      off_route: $("offroute").checked, record: $("record").checked, route_name: $("route-name").value.trim(),
     });
   } catch (e) {
     if (e.message.startsWith("Sticky notes")) { $("notes-error").textContent = e.message; $("notes-error").hidden = false; $("notes").focus(); }
@@ -744,6 +744,15 @@ function showResults(r) {
     `<span class="t">[${fmt(o.t)}]</span></span><span class="d">${fmt(o.dur)}</span></li>`).join("")
     : `<li class="empty">${r.off_route_holds ? "None flagged." : "No off-route holds were found, so there was nothing to flag."}</li>`;
   $("offroute-list").querySelectorAll("li[data-i]").forEach((li) => li.addEventListener("click", () => seek(offr[+li.dataset.i].t)));
+
+  const lb = r.library, note = $("library-note");
+  note.hidden = !lb;
+  if (lb) {
+    note.textContent = lb.saved
+      ? `Saved to your library${lb.route ? ` as “${lb.route}”` : " (no route name)"}${lb.climbs ? ` · ${lb.climbs} climb${lb.climbs === 1 ? "" : "s"} of this route` : ""}.`
+      : lb.message;
+    if (lb.saved) libraryInfo().then((l) => l && routeNames(l));     // the name just used is now a suggestion
+  }
 
   $("notes-block").hidden = !r.notes.length;
   $("notes-list").innerHTML = r.notes.map((n, i) =>
@@ -873,3 +882,21 @@ function restart() {
   show("step-upload");
 }
 ["restart-1", "restart-2", "restart-3"].forEach((id) => $(id).addEventListener("click", restart));
+
+// ------------------------------------------------------------------ the library options (saving is opt-out)
+async function libraryInfo() {
+  try {
+    const r = await fetch("/api/library");
+    return r.ok ? await r.json() : null;
+  } catch (_) { return null; }                    // the page works without it
+}
+function routeNames(lib) {
+  $("route-names").innerHTML = lib.routes.map((x) => `<option value="${esc(x.name)}"></option>`).join("");
+}
+(async function libraryOptions() {
+  const lib = await libraryInfo();
+  if (!lib) return;
+  $("record").checked = lib.enabled;
+  $("record-where").textContent = `(a small file, no video, kept in ${lib.path})`;
+  routeNames(lib);
+})();

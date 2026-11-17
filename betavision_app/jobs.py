@@ -20,7 +20,6 @@ import os
 import queue
 import re
 import shutil
-import statistics
 import subprocess
 import sys
 import threading
@@ -39,6 +38,7 @@ sys.path.insert(0, str(ROOT))      # climb_*.py live in the repo root
 import climb_analyze as ca         # noqa: E402
 import climb_compare as ccmp       # noqa: E402
 import climb_holds as ch           # noqa: E402
+import climb_library as lib        # noqa: E402
 import climb_motion as cm          # noqa: E402
 import climb_notes as cn           # noqa: E402
 import climb_offroute as co        # noqa: E402
@@ -48,8 +48,8 @@ from .cache import ByteLRU          # noqa: E402
 
 WORKSPACE = ROOT / "workspace"     # uploads + outputs, wiped every time the app starts
 VIDEO_TYPES = {".mp4", ".mov", ".avi"}
-LIMB_NAMES = {"l_hand": "Left hand", "r_hand": "Right hand", "l_foot": "Left foot", "r_foot": "Right foot"}
-ANGLE_NAMES = {"elbow": "Elbows", "knee": "Knees", "hip": "Hips"}
+LIMB_NAMES = lib.LIMB_NAMES
+ANGLE_NAMES = lib.ANGLE_NAMES
 CACHE_BYTES = int(float(os.environ.get("BETAVISION_CACHE_MB", 1536)) * 1024 * 1024)   # per job: frames, colour data, outlines
 MAX_KEPT_JOBS = 4         # jobs that aren't busy (picking / done / failed) kept in memory; the least recently used are freed
 BUSY = ("uploading", "preparing", "starting", "queued", "running")
@@ -87,6 +87,7 @@ class Job:
         self.discard = False           # freed while busy: free it when it stops
         self.cam, self.moved, self.keyframes = None, 0.0, None   # keyframes: set when the camera moved a lot
         self.off_route, self.flag_off_route = [], True             # off-route wall holds (base pixels), flag touches?
+        self.record, self.route_name = False, ""                    # keep a climb record in the library? under which route name
         self.pose = None               # after the analysis: (px, vis, wall) per frame, for a comparison
         self.cam_used = None           # the camera homographies the analysis used (None = still camera)
         self.compare = None            # comparison with a second climb: {state, message, progress, results}
@@ -651,29 +652,8 @@ def mark_starts(holds, starts):
 def summarize(job, res, holds, vols):
     """Turn analyze_video's per-frame data into what the results panel shows."""
     fps, frames = res["fps"], res["frames"]
-    min_run = max(3, int(round(0.2 * fps)))        # ignore contacts shorter than ~0.2 s (tracking jitter)
-    moves = []
-    for limb, label in LIMB_NAMES.items():
-        run_hold, run_start = "", 0
-        for i, lh in enumerate(res["limb_holds"] + [{}]):
-            hid = lh.get(limb, "")
-            if hid != run_hold:
-                if run_hold != "" and i - run_start >= min_run:
-                    moves.append({"t": round(run_start / fps, 2), "dur": round((i - run_start) / fps, 2),
-                                  "limb": label, "hold": run_hold, "volume": isinstance(run_hold, str)})
-                run_hold, run_start = hid, i
-    moves.sort(key=lambda m: (m["t"], m["limb"]))
-    roles = {hd["id"]: hd.get("role", "") for hd in holds}
-    for m in moves:
-        m["role"] = "" if m["volume"] else roles.get(m["hold"], "")
-
-    angles = []
-    for key, label in ANGLE_NAMES.items():
-        vals = [a[k] for a in res["angles"] for k in (f"l_{key}_deg", f"r_{key}_deg")
-                if k in a and not math.isnan(a[k])]
-        if vals:
-            angles.append({"joint": label, "min": round(min(vals)), "median": round(statistics.median(vals)),
-                           "max": round(max(vals))})
+    moves = [dict(m, limb=LIMB_NAMES[m["limb"]]) for m in lib.contact_moves(res["limb_holds"], fps, holds)]
+    angles = lib.angle_ranges(res["angles"])
 
     notes = []
     for n in res["notes"]:
@@ -684,9 +664,7 @@ def summarize(job, res, holds, vols):
             to = f"volume {n['hold']}" if isinstance(n["hold"], str) else f"hold {n['hold']}"
         notes.append({"start": n["start"], "end": n["end"], "text": n["text"], "to": to})
 
-    off = [{"t": e["t"], "dur": e["dur"], "limb": LIMB_NAMES.get(e["limb"], e["limb"]), "hold": e["hold"],
-            "on_volume": next((hd.get("volume") for hd in res.get("off_route_holds", []) if hd["id"] == e["hold"]), None)}
-           for e in res.get("off_route", [])]
+    off = [dict(o, limb=LIMB_NAMES.get(o["limb"], o["limb"])) for o in lib.off_route_touches(res)]
 
     used = sorted({m["hold"] for m in moves if not m["volume"]})
     return {"frames": frames, "fps": round(fps, 2), "duration_s": round(frames / fps, 2),
@@ -796,6 +774,28 @@ def summarize_compare(job, s):
             "video_url": f"/api/jobs/{job.id}/compare/video", "check_url": f"/api/jobs/{job.id}/compare/check"}
 
 
+# ---------------------------------------------------------------- the climb library
+def save_to_library(job, res):
+    """Keep a climb record of this analysis (climb_library) unless the user opted out. Never
+    fails the analysis: returns what the page shows, {saved, route, climbs, message}."""
+    if not job.record:
+        return {"saved": False, "message": "Not saved to the library (you turned it off)."}
+    if not job.holds:
+        return {"saved": False, "message": "Not saved to the library: no route was marked, so there is nothing to learn from."}
+    try:
+        path, rec = lib.record_analysis(res, job.holds, job.vols, job.input.name, base_frame=job.base,
+                                        frame_size=(job.width, job.height), route_name=job.route_name)
+        out = {"saved": True, "route": rec["route"]["name"], "path": str(path), "climbs": None,
+               "message": ""}
+        if rec["route"]["id"]:
+            records, _ = lib.read_library()
+            out["climbs"] = sum(r["route"]["id"] == rec["route"]["id"] for r in records)
+        return out
+    except Exception as e:                              # a full disk or a read-only home folder
+        traceback.print_exc()
+        return {"saved": False, "message": f"Couldn't save to the library: {e}"}
+
+
 # ---------------------------------------------------------------- the background worker
 STAGES = {"lock": "Locking each hold onto the wall", "track": "Tracking the climber",
           "draw": "Drawing the video"}
@@ -842,7 +842,7 @@ class Worker:
         for j in drop:
             j.free()
 
-    def start(self, job, picker_state, model, notes, use_lock, flag_off_route=True):
+    def start(self, job, picker_state, model, notes, use_lock, flag_off_route=True, record=False, route_name=""):
         """picking/error -> starting -> queued. The first caller flips the state under the lock,
         so a second request (Enter plus a click) gets JobBusy instead of queueing the job twice."""
         with self.lock:
@@ -860,6 +860,7 @@ class Worker:
             raise
         job.model, job.notes, job.use_lock = model, notes, use_lock
         job.flag_off_route = bool(flag_off_route)
+        job.record, job.route_name = bool(record), route_name
         job.cache.clear()                               # the picker's frames and colour data aren't needed any more
         job.state, job.stage, job.progress = "queued", "queued", 0.0
         job.message = "Waiting for the previous climb to finish"
@@ -910,5 +911,6 @@ class Worker:
         job.csv = res["out_csv"]
         job.pose, job.cam_used = (res["px"], res["vis"], res["wall"]), cam
         job.results = summarize(job, res, job.holds, job.vols)
+        job.results["library"] = save_to_library(job, res)
         job.state, job.message = "done", ""
         print(f"[{job.id}] done: {job.output}")

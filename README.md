@@ -39,6 +39,7 @@ Built with Python, OpenCV and MediaPipe Pose.
 - **Top-out detection.** When both hands match on the end hold, a *CONGRATULATIONS!* banner appears with the time, and the hold overlays clear away.
 - **Interactive picker UI.** Scrub through the video, zoom (up to 4x) and scroll to mark small holds precisely, undo any action, with an on-screen instructions panel.
 - **Clean output.** Saves a single annotated video by default. Optional per-frame CSV (joint positions, elbow/knee/hip angles, which hold each limb is on, an `off_route_touch` column such as `l_foot:X3` while a possible off-route touch lasts, and each joint in wall coordinates, `<joint>_wx` / `<joint>_wy`, the pixels of the frame the route was marked in) with `--save-data`. New columns are always added at the end.
+- **A library of recorded climbs.** After each analysis one small JSON climb record (no video or frames, a few tens of KB) is saved to `~/.climb_analyzer/library`: the route as marked (hold outlines and centres, start/end tags, volumes, in base-frame pixels and relative to the start-to-end extent), the hold sequence, possible off-route touches, whether and when you topped out, joint-angle ranges, and the video's name and date. Give the route a name and records of the same route are grouped (see [The climb library](#the-climb-library)). Opt out with `--no-record` or the page's checkbox.
 - **Compare two climbs of the same route** (first version, see [Comparing two climbs](#comparing-two-climbs)). The second video can be filmed from elsewhere: its wall is matched to the first video's, the two climbs are lined up move by move with dynamic time warping, and you get a side-by-side video plus where the hold sequences, the time per move and the posture differ.
 
 ## How it works
@@ -141,6 +142,8 @@ Hold numbers are the ones shown in the picker. To add notes without marking the 
 ### Options
 
 ```bash
+python climb_analyze.py my_climb.mov --route-name "Blue wall V3"   # group this climb's record with others of the route
+python climb_analyze.py my_climb.mov --no-record            # don't keep a climb record in the library
 python climb_analyze.py my_climb.mov --save-data            # also save CSV + holds JSON/PNG
 python climb_analyze.py my_climb.mov --holds my_climb_holds.json   # reuse marked holds
 python climb_analyze.py my_climb.mov --model heavy          # more accurate, slower (lite/full/heavy)
@@ -171,6 +174,23 @@ In the web app, a finished analysis (with the route marked) has a *Compare with 
 
 **State of this feature.** Tested on real footage only partly: there is no pair of videos of the *same route* in the test set yet. What was checked: the wall registration between two different real camera positions on the same wall (two clips of different routes, which line up to within a couple of pixels where the wall overlaps), and the whole comparison on one real climb against a copy of itself that was trimmed, played at a varying speed (0.3x to 1.5x) and seen through a different (synthetic) camera position: the alignment found the right frame to a median of 1 frame (90% within 5 frames, worst 11), the registration was within 2.5 px (median) of the true one, and the time per move matched the known timing except one move boundary during a rest. Comparing the same climber filmed two ways also showed how noisy the pose is between views: joint angles differ by up to ~20°, which is why posture sections start at 25°; one false section remained, at the drop-off after the top, where the alignment lags by ~0.25 s during fast movement. Two genuinely different climbers on one route are still to be tried.
 
+## The climb library
+
+Recording is on by default. This writes **outside the project folder**, so it has an opt-out: `--no-record` on the command line, the *Save this climb to my library* checkbox in the web app, or `BETAVISION_RECORD=0` to make the web app's checkbox start unticked. A record is one JSON file (`<id>.json`) with a `schema_version`; a record from a newer BetaVision than yours is skipped with a message rather than misread. Nothing is saved when no route was marked (there'd be nothing to learn from).
+
+- **Where:** `~/.climb_analyzer/library` (next to the pose model). Change it with `--library DIR` or the `BETAVISION_LIBRARY` environment variable. The folder survives restarts, unlike the web app's `workspace/`. Delete a file to forget a climb.
+- **Route names:** `--route-name "Blue wall V3"` or the page's *Route name* box (it suggests names already in the library). Names are matched ignoring capitals and extra spaces; records with the same name share a route id. A climb without a name is stored unnamed and is never grouped with others.
+- **What's in a record:** the route (hold outlines, simplified, and centres, start/end roles, volumes), the moves (limb, hold or volume id, start time, duration; contacts under ~0.2 s are ignored, as in the results panel), possible off-route touches, whether and when you topped out, joint-angle ranges, video name and date, and when it was recorded.
+
+Read it:
+
+```bash
+python climb_library.py list                    # every recorded climb, and the named routes
+python climb_library.py route "Blue wall V3"    # a route with two or more records
+```
+
+For a named route with two or more records, `route` shows the hold sequence most climbs used for each hand and foot (holds from different records are matched by where they are relative to the route, not by number, because the picker numbers holds bottom to top and a missed hold shifts the rest) and the fastest climb that topped out, timed from the first hold contact to the top. The web app serves the same at `/api/library` and `/api/library/route?name=...`. That is all the "suggestion" there is so far: **learned beta suggestions need many more recorded climbs of a route than most people will have, so that roadmap item stays open.**
+
 ## Web app (Windows)
 
 Prefer clicking to typing commands? BetaVision also runs as a local web app. It uses exactly the same analysis code, and everything stays on your computer: no cloud, no account.
@@ -193,6 +213,8 @@ Prefer clicking to typing commands? BetaVision also runs as a local web app. It 
 3. Mark the route just like the OpenCV picker: click one hold to find every hold of that colour, switch to *Just this hold* (**M**) for any it missed, right-click wrong holds or volumes, tag start (**S**) and end (**E**) holds. Volumes are found for you; add a missed one with **V** (click it) or **P** (click its corners). Scroll to zoom, drag to move. Or choose *Skip holds* to track the body only.
 4. Optionally type sticky notes, one per line, in the same format as a notes file (see [Sticky notes](#sticky-notes)). Untick *Flag possible off-route touches* to turn that off (orange-red dashed outlines in the picker are the off-route holds; right-click a wrong one).
 5. Click **Analyze climb**. When it's done you get the annotated video in the page, the results (how much of the climb was tracked, top-out time, holds used, the hold and volume sequence, possible off-route touches, where each note was pinned, joint angle ranges; click a move or a flag to jump there) and a **Download annotated video** button.
+
+The options also have a *Route name* box and a *Save this climb to my library* checkbox (see [The climb library](#the-climb-library)); the results say whether the climb was saved.
 
 Uploads and results are kept in a `workspace/` folder next to the app, which is emptied every time the app starts. Download anything you want to keep. The route you marked is saved there too as `<name>_holds.json`, reusable with the command line's `--holds`.
 
@@ -248,7 +270,7 @@ These are results on synthetic walls; real gym footage will vary. Off-route touc
 - [x] Flag off-route hold touches in the video
 - [x] Camera-motion compensation (feature tracking / homography) and whole-wall panorama
 - [ ] Native iOS app (Swift, AVFoundation, Apple Vision)
-- [ ] Beta suggestions learned from recorded move sequences
+- [ ] Beta suggestions learned from recorded move sequences (recording and a first read side exist, see [The climb library](#the-climb-library); the learning needs many recorded climbs of a route)
 
 ## License
 

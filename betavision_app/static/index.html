@@ -132,6 +132,13 @@
             </select>
             <label class="check" id="lock-row" hidden><input type="checkbox" id="lock" checked><span>Lock each hold onto the wall <span class="muted">(slower, steadier outlines)</span></span></label>
             <label class="check" id="offroute-row"><input type="checkbox" id="offroute" checked><span>Flag possible off-route touches <span class="muted">(a hand or foot resting on a hold of another colour)</span></span></label>
+            <label class="check" id="record-row"><input type="checkbox" id="record" checked><span>Save this climb to my library <span class="muted" id="record-where">(a small file, no video, kept in ~/.climb_analyzer/library)</span></span></label>
+          </div>
+          <div class="field" id="route-field">
+            <label class="field-label" for="route-name">Route name <span class="muted">optional</span></label>
+            <input id="route-name" type="text" maxlength="80" list="route-names" autocomplete="off" spellcheck="false" placeholder="e.g. Blue wall V3">
+            <datalist id="route-names"></datalist>
+            <p class="hint small">Climbs saved under the same name are grouped as one route. Without a name, the climb is saved on its own.</p>
           </div>
         </div>
       </div>
@@ -264,6 +271,7 @@
           <p class="hint small">A hand or foot that rested on a hold that isn't on the route for about 0.6 s or more. Check the video: pose tracking is 2D, so a limb in front of a hold can look like it's on it. Click a row to jump there.</p>
           <ul id="offroute-list" class="moves offroute-list"></ul>
         </div>
+        <p id="library-note" class="hint small" hidden></p>
         <div id="notes-block" hidden>
           <div class="section-head"><h2>Sticky notes</h2></div>
           <ul id="notes-list" class="moves notes-list"></ul>
@@ -284,7 +292,7 @@
   </section>
 </main>
 
-<footer class="site">Everything stays on this computer. Videos are cleared the next time BetaVision starts.</footer>
+<footer class="site">Everything stays on this computer. Videos are cleared the next time BetaVision starts; saved climb records (no video) are kept.</footer>
 <script src="app.js"></script>
 </body>
 </html>

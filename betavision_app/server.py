@@ -7,6 +7,8 @@ and a small JSON API:
   POST /api/jobs/{id}/holds           picker state -> detected holds + volumes (preview)
   POST /api/jobs/{id}/start           start the analysis in the background
   DELETE /api/jobs/{id}               the user started over: free the job's memory and files
+  GET  /api/library                   library path, whether saving is on by default, named routes
+  GET  /api/library/route?name=...    most common sequences + fastest topped climb of a route
   GET  /api/jobs/{id}                 status / progress / results (the page polls this)
   GET  /api/jobs/{id}/video           annotated H.264 video (inline)
   GET  /api/jobs/{id}/download        the same video as a download
@@ -28,6 +30,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import jobs
+from .jobs import lib
 
 STATIC = Path(__file__).resolve().parent / "static"
 MODELS = ("lite", "full", "heavy")
@@ -59,6 +62,8 @@ class StartRequest(BaseModel):
     notes: str = ""                 # sticky notes, one per line (as in a --notes file)
     lock: bool = True               # fine-tune each hold per frame (CLI: unless --no-lock)
     off_route: bool = True          # flag possible off-route touches (CLI: unless --no-off-route)
+    record: bool = True             # keep a climb record in the library (CLI: unless --no-record)
+    route_name: str = ""            # name of the route, groups records of the same route
 
 
 @app.post("/api/upload")
@@ -103,8 +108,33 @@ def start(job_id: str, req: StartRequest):
     except ValueError as e:
         raise HTTPException(400, f"Sticky notes: {e}")
     picker = job.clean_picker(req.picker) if req.picker else None     # 400 with a readable message
-    worker.start(job, picker, req.model if req.model in MODELS else "full", notes, req.lock, req.off_route)
+    try:
+        route_name = lib.clean_name(req.route_name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    worker.start(job, picker, req.model if req.model in MODELS else "full", notes, req.lock, req.off_route,
+                 req.record, route_name)
     return job.status()
+
+
+@app.get("/api/library")
+def library():
+    """What the page needs for the "save to my library" option: is it on by default, where it
+    lives, and the route names already used (offered as suggestions)."""
+    records, problems = lib.read_library()
+    named, unnamed = lib.routes(records)
+    return {"enabled": lib.recording_default(), "path": str(lib.library_dir()), "climbs": len(records),
+            "routes": named, "unnamed": unnamed, "skipped": problems}
+
+
+@app.get("/api/library/route")
+def library_route(name: str):
+    """Most common hold sequence per limb and the fastest topped climb of a named route."""
+    records, _ = lib.read_library()
+    try:
+        return lib.route_report(records, name)
+    except KeyError:
+        raise HTTPException(404, f"No recorded climbs of a route called '{name}'.")
 
 
 @app.delete("/api/jobs/{job_id}")

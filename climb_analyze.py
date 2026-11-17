@@ -21,6 +21,8 @@ climb_analyze.py - holds + body tracking in one go.
         right side   orange skeleton
   3. Saves ONE file next to the video: <name>_analysis.mp4
      (add --save-data to also save the per-frame CSV and the holds JSON/PNG)
+  4. Keeps a small "climb record" (route, hold sequence, topped out?, angles; no video) in
+     ~/.climb_analyzer/library for later (see climb_library.py). --no-record turns this off.
 
 Needs climb_holds.py and climb_pose.py in the same folder.
 
@@ -30,6 +32,8 @@ Usage:
     python climb_analyze.py IMG_5687.MOV --holds IMG_5687_holds.json   # reuse saved holds, skip the picker
     python climb_analyze.py IMG_5687.MOV --model heavy --show
     python climb_analyze.py IMG_5687.MOV --no-off-route                # don't flag off-route touches
+    python climb_analyze.py IMG_5687.MOV --route-name "Blue wall V3"   # group the climb record with others of this route
+    python climb_analyze.py IMG_5687.MOV --no-record                   # don't keep a climb record in the library
 """
 
 import sys
@@ -39,6 +43,7 @@ import argparse
 import csv
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -48,6 +53,7 @@ from mediapipe.tasks import python as mp_tasks
 from mediapipe.tasks.python import vision
 
 import climb_holds as ch
+import climb_library as lib
 import climb_motion as cm
 import climb_notes as cn
 import climb_offroute as co
@@ -511,7 +517,17 @@ def main():
     ap.add_argument("--notes", default=None, help="text file of sticky notes, one per line")
     ap.add_argument("--no-off-route", action="store_true",
                     help="don't look for (or flag) touches of holds that aren't on the route")
+    ap.add_argument("--no-record", action="store_true",
+                    help="don't keep a climb record in the library (~/.climb_analyzer/library)")
+    ap.add_argument("--route-name", default="", metavar="NAME",
+                    help="name of the route: climb records with the same name are grouped as one route")
+    ap.add_argument("--library", default=None, metavar="DIR",
+                    help="where climb records are kept (default: ~/.climb_analyzer/library, or $BETAVISION_LIBRARY)")
     args = ap.parse_args()
+    try:
+        route_name = lib.clean_name(args.route_name)
+    except ValueError as e:
+        sys.exit(str(e))
 
     video = Path(args.video)
     if not video.exists():
@@ -559,6 +575,26 @@ def main():
     print(f"  video -> {res['out_video']}")
     if args.save_data:
         print(f"  data  -> {res['out_csv']}")
+    if not args.no_record:
+        record_climb(res, holds, vols, video, base, route_name, args.library)
+
+
+def record_climb(res, holds, vols, video, base, route_name, library):
+    """Keep this climb in the library. Failing to write never loses the analysis."""
+    try:
+        cap = cv2.VideoCapture(str(video))
+        size = (int(cap.get(3)), int(cap.get(4)))
+        cap.release()
+        date = datetime.fromtimestamp(video.stat().st_mtime).date().isoformat()
+        path, rec = lib.record_analysis(res, holds, vols, video.name, library, base_frame=base,
+                                        frame_size=size, route_name=route_name, video_file_date=date)
+    except Exception as e:
+        print(f"  library: couldn't save the climb record ({e})")
+        return
+    if path is None:
+        print("  library: no route was marked, so no climb record was kept.")
+        return
+    print(f"  library: saved {path}" + (f" (route '{route_name}')" if route_name else " (no route name)"))
 
 if __name__ == "__main__":
     main()
