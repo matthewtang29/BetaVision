@@ -21,8 +21,11 @@ Built with Python, OpenCV and MediaPipe Pose.
 ## Features
 
 - **Full-body pose tracking.** 16 climbing-relevant joints per frame (shoulders, elbows, wrists, hands, hips, knees, ankles, heels, toes) using MediaPipe Pose, drawn as a colour-coded skeleton (left side blue, right side orange).
-- **One-click hold detection.** Click one hold and every hold of that colour is outlined. Colour matching runs in CIELAB space after flattening uneven gym lighting, so spotlights and dark corners don't break it. Sampling ignores chalk and bolt holes.
-- **Grey, white and black holds.** The wall is grey too, so colour alone can't separate them. These are found by their outline instead: hold-sized curved edge arcs whose inside matches the clicked grey.
+- **One-click hold detection.** Click one hold and every hold of that colour is outlined. The clicked hold is outlined first and its colour is measured over the whole hold, leaving out chalk, highlights and shadow, so it doesn't matter where on the hold (or on which hold of the colour) you click; the clicked hold is always in the result. Matching runs in CIELAB space after flattening uneven gym lighting: same hue (within the clicked hold's own spread) and clearly more colourful than the wall around it, so dark or pale colours like navy and light blue don't pull in the wall, and pink/red or green/yellow stay apart.
+- **Grey, white and black holds.** A hold counts as grey only if the clicked hold itself has no colour (a click on chalk or a highlight still reads the hold's colour). Grey holds are matched by how much brighter or darker than the surrounding wall they are, compared with the clicked one; patches that only just stand out (chalk smudges, lighter wall) are dropped.
+- **The climber is never a hold.** MediaPipe's person mask (the same pose model as the tracking) is cut out of the picker frame, and a click on the climber is refused.
+- **Clicks that add nothing say so.** Clicking a hold that's already selected, bare wall or the climber adds nothing and shows why. Clicking a *missed* hold of the route adds its shade to the match.
+- **Deletes stay deleted.** Right-click removes the hold's whole outline from the match, so it doesn't come back when you change the colour tolerance or add clicks, and it never takes a neighbouring hold with it.
 - **Automatic volume detection.** Volumes (the big grey geometric shapes) are always allowed on every route. BetaVision finds them from their sharp corners: it segments grey regions bounded by edges, keeps straight-sided polygons with few corners, merges touching faces, and follows long straight grey-on-grey edges (ignoring wall panel seams) to complete faces lit like the wall.
 - **Coloured volumes follow gym rules.** Grey/neutral volumes are always allowed; a painted volume only counts if it's the route's colour (add one by hand with V/P to force it in).
 - **Off-route holds on volumes are cut out.** A hold bolted onto a volume that differs from the volume's own colour (so painted volumes work too) is removed from the volume, so touching it still counts as off-route. Route holds on volumes are never cut.
@@ -43,7 +46,7 @@ video ──► camera tracking (optical flow + ORB re-anchoring) ─► homogra
             │  camera moved? ─► stitch whole-wall panorama
             ▼
           hold picker (OpenCV UI)
-            │  click a hold ─► CIELAB colour match / outline arcs ─► holds + start/end tags
+            │  click a hold ─► outline it, model its colour ─► hue / brightness match ─► holds + start/end tags
             │  automatic ─► grey polygons + straight edges ─► volumes (minus off-route holds)
             ▼
           MediaPipe Pose (VIDEO mode, frame by frame)
@@ -97,8 +100,8 @@ python climb_analyze.py my_climb.mov
 
 | Key / mouse | Action |
 |---|---|
-| Left click | AUTO: find all holds of this colour · MANUAL: add this one hold |
-| Right click | Delete the hold (or volume) under the cursor |
+| Left click | AUTO: find all holds of this colour (a click on an already-selected hold, bare wall or the climber adds nothing) · MANUAL: add this one hold |
+| Right click | Delete the hold (or volume) under the cursor; it stays deleted at any colour tolerance |
 | `M` | Switch AUTO / MANUAL |
 | `S` / `E` | Next click tags a START / END hold |
 | `V` | Next click auto-outlines a volume the auto-detect missed |
@@ -189,15 +192,19 @@ Measured on 16 generated walls with uneven lighting, chalk, panel seams, bolt ho
 | Volumes found (10 walls not used for tuning) | 34 / 35, 0 false detections, ~89% outline overlap |
 | Coloured holds found (red / blue / green), on wall and on volumes | 100% |
 | Off-route holds on volumes cut out | 29 / 31, route holds wrongly cut: 0 / 36 |
-| Grey holds found | ~46% (manual mode for the rest) |
+| Grey holds found | ~46% (measured before the hold-segmenting picker; manual mode for the rest) |
 | Outline position while panning (rough handheld shake, motion blur, zoom, tilt) | median ~2 px off, worst frame ~15 px; without tracking: ~500 px |
-| Speed | volumes ~0.3 s per frame, holds ~0.05 s per click, camera tracking ~20 ms per frame, stitching ~5 s |
+| Speed | volumes ~0.3 s per frame, holds: first click on a frame ~0.3–0.5 s (outlining the hold, finding the climber), each refresh after that ~0.05–0.1 s, camera tracking ~20 ms per frame, stitching ~5 s |
 
-These are results on synthetic walls; real gym footage will vary.
+These are results on synthetic walls; real gym footage will vary. On 40 clicks across 6 real gym videos (`tools/eval_colour_pick.py`), the clicked hold was in the result every time.
 
 ## Limitations
 
-- Grey/white holds that are almost exactly the wall's brightness can still be missed by auto-detect. Use manual mode for those.
+- Grey/white holds that are almost exactly the wall's brightness can still be missed by auto-detect. Use manual mode for those. White holds also match white volumes and some highlights; right-click those.
+- Grey/white/cream holds: the other holds of the colour are found less often than coloured ones (they must stand out from the wall about as much as the clicked one). Click a missed one to add it.
+- Two holds of the same colour that touch come out as one outline.
+- A painted volume of the route's colour (or one with streaks of it) can be partly matched as a hold.
+- With a moving camera, a small hold can show up twice a few cm apart when the camera tracking is slightly off between two keyframes; deleting one removes both.
 - Volume detection assumes grey volumes. Wooden or brightly painted volumes need to be added with **V**.
 - Camera tracking assumes a flat wall. Strong overhangs or roofs filmed from close up bend the geometry and outlines can drift slightly.
 - Very fast whip-pans with heavy motion blur can lose tracking for a moment.

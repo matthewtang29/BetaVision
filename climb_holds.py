@@ -42,6 +42,7 @@ Window controls (also listed in the window itself):
 import argparse
 import json
 import sys
+import threading
 from pathlib import Path
 
 import cv2
@@ -166,36 +167,6 @@ def inside(hold, pt):
 
 
 # ---------------------------------------------------------------- AUTO: every hold of a colour
-def outline_arcs(lab):
-    """Hold-sized curved edge pieces. Every hold has an outline (its edge and the shadow
-    under it); on a grey wall a grey hold's outline is often broken where the lit side
-    matches the wall, but what's left is still a curved arc around the hold. The convex
-    hull of each arc approximates the hold. Straight pieces (creases, seams) are skipped.
-    Returns [(hull, median Lab inside)]."""
-    h, w = lab.shape[:2]
-    L = np.clip(lab[..., 0], 0, 255).astype(np.uint8)
-    e = cv2.Canny(cv2.GaussianBlur(L, (5, 5), 0), 12, 35)
-    e = cv2.dilate(e, np.ones((3, 3), np.uint8))
-    n, lbl, st, _ = cv2.connectedComponentsWithStats(e, connectivity=8)
-    out = []
-    for i in range(1, n):
-        x, y, bw, bh, a = st[i]
-        if max(bw, bh) < 0.02 * _fd(h, w)[0] or max(bw, bh) > 0.15 * _fd(h, w)[0]:
-            continue
-        pts = np.column_stack(np.where(lbl[y:y + bh, x:x + bw] == i))[:, ::-1] + [x, y]
-        hull = cv2.convexHull(pts.astype(np.int32))
-        (_, _), (rw, rh), _ = cv2.minAreaRect(hull)
-        if min(rw, rh) < 0.25 * max(rw, rh):
-            continue                                       # straight-ish: crease or seam
-        m = np.zeros((bh, bw), np.uint8)
-        cv2.drawContours(m, [hull - [x, y]], -1, 1, -1)
-        m &= (lbl[y:y + bh, x:x + bw] != i)                # inside the arc, not the arc itself
-        if m.sum() < 20:
-            continue
-        out.append((hull, np.median(lab[y:y + bh, x:x + bw][m > 0], axis=0)))
-    return out
-
-
 def _hold_shaped(c, area, strict=True):
     """Reject long thin strips (edges of volume faces, seams, panel edges). Coloured holds
     can be oddly shaped (X / bow-tie / crescent), so the non-strict test is looser."""
@@ -208,49 +179,536 @@ def _hold_shaped(c, area, strict=True):
     return max(rw, rh) / min(rw, rh) < 6.0 and area / max(hull_area, 1) > 0.35
 
 
-def find_holds_auto(lab, samples, tol=22, min_area=None):
-    h, w = lab.shape[:2]
-    if not samples:
+#
+# One AUTO click -> hold_model(): the clicked hold is segmented FIRST (by colour if it has
+# one, by brightness if it's white / grey / black), and its colour is then measured over the
+# whole hold, leaving out chalk, highlights and shadow. So it doesn't matter where on the hold
+# you click, or which hold of the colour. find_holds_auto() then outlines every blob that
+# matches a model: same hue (within the hold's own hue spread) and clearly more colourful than
+# the wall around the clicked hold (or, for grey holds, clearly brighter / darker than it).
+# The clicked hold itself is always in the result; the climber never is.
+
+COLOURFUL = 12            # Lab chroma above this counts as "has a colour" when looking near a click
+SEED_HUE = 24             # degrees: hue band used to segment the clicked hold
+GREY_CONTRAST = 20        # a grey hold must differ from the wall around it by this much (L)
+PALE_MARGIN = 4           # a hold not more colourful than the wall (by this much) is matched as grey
+PERSON_OVERLAP = 0.7      # a blob more than this much covered by the climber isn't a hold
+FRAGMENT_RING = 0.3       # a blob whose surroundings are this much its own colour is a piece of something bigger
+MAX_AREA_FRAC = 0.03      # usual size cap for a found hold (fraction of one frame) ...
+SEED_AREA_MULT = 2.5      # ... raised to this x the largest clicked hold
+
+
+class FrameColour:
+    """Everything the colour picker needs about one picture, computed once and reused on
+    every refresh: flattened Lab, chroma, hue and (lazily) where the climber is."""
+
+    def __init__(self, img=None, lab=None):
+        self.img = img
+        self.lab = to_lab(img) if lab is None else lab
+        self.h, self.w = self.lab.shape[:2]
+        self.mind = _fd(self.h, self.w)[0]
+        self.L = self.lab[..., 0]
+        a, b = self.lab[..., 1] - 128, self.lab[..., 2] - 128
+        self.C = np.hypot(a, b)
+        self.H = np.degrees(np.arctan2(b, a))          # hue angle, -180..180
+        self._person = None
+        self._Lbg = None
+
+    def wall_L(self):
+        """Brightness of the wall around each pixel (median over ~10% of the frame): grey
+        holds are matched by how much brighter / darker they are than the wall around them,
+        since the lighting flattening makes absolute brightness unreliable."""
+        if self._Lbg is None:
+            f = 4
+            small = cv2.resize(np.clip(self.L, 0, 255).astype(np.uint8), (max(1, self.w // f), max(1, self.h // f)),
+                               interpolation=cv2.INTER_AREA)
+            bg = cv2.medianBlur(small, max(3, int(self.mind * 0.1 / f) | 1))
+            self._Lbg = cv2.resize(bg, (self.w, self.h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+        return self._Lbg
+
+    def person_wide(self):
+        """The climber's mask grown by a few px (its edge is soft)."""
+        if getattr(self, "_person_wide", None) is None:
+            self._person_wide = cv2.dilate(self.person(), _box(max(1, int(self.mind * 0.004))))
+        return self._person_wide
+
+    def person(self):
+        """1 where the climber is (MediaPipe), 0 elsewhere. All 0 without a picture / model."""
+        if self._person is None:
+            self._person = (person_mask(self.img) if self.img is not None
+                            else np.zeros((self.h, self.w), np.uint8))
+        return self._person
+
+
+_PERSON = {"setup": None, "tried": False, "lock": threading.Lock()}
+
+
+def person_mask(img):
+    """Where the climber is, from MediaPipe's pose segmentation (the same pose model the
+    analysis uses, downloaded once). Returns zeros if MediaPipe can't run."""
+    h, w = img.shape[:2]
+    with _PERSON["lock"]:                    # MediaPipe isn't thread-safe: one frame at a time
+        if not _PERSON["tried"]:
+            _PERSON["tried"] = True
+            try:
+                import mediapipe as mp
+                from mediapipe.tasks import python as mp_tasks
+                from mediapipe.tasks.python import vision
+                import climb_pose
+                cache = Path.home() / ".climb_analyzer"
+                model = next((cache / f"pose_landmarker_{k}.task" for k in ("full", "heavy", "lite")
+                              if (cache / f"pose_landmarker_{k}.task").exists()), None)
+                model = model or climb_pose.ensure_model("full")
+                opts = vision.PoseLandmarkerOptions(
+                    base_options=mp_tasks.BaseOptions(model_asset_path=str(model)),
+                    running_mode=vision.RunningMode.IMAGE, num_poses=2, output_segmentation_masks=True,
+                    min_pose_detection_confidence=0.3)
+                _PERSON["setup"] = (vision, opts, mp)
+            except Exception as e:           # no MediaPipe / no model / offline: just don't mask
+                print(f"  (Couldn't load the pose model to hide the climber from the picker: {e})")
+        if _PERSON["setup"] is None:
+            return np.zeros((h, w), np.uint8)
+        vision, opts, mp = _PERSON["setup"]
+        try:
+            # a landmarker per frame (closed by `with`): once per picker frame, ~0.15 s; one kept
+            # open for the whole program errors when Python tears it down at exit
+            with vision.PoseLandmarker.create_from_options(opts) as lm:
+                res = lm.detect(mp.Image(image_format=mp.ImageFormat.SRGB,
+                                         data=np.ascontiguousarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))))
+        except Exception as e:
+            print(f"  (Pose segmentation failed: {e})")
+            return np.zeros((h, w), np.uint8)
+    out = np.zeros((h, w), np.uint8)
+    for sm in res.segmentation_masks or []:
+        m = sm.numpy_view()
+        m = m[..., 0] if m.ndim == 3 else m
+        if m.shape != (h, w):
+            m = cv2.resize(m, (w, h))
+        out |= (m > 0.5).astype(np.uint8)
+    return out
+
+
+def _hue_diff(H, h0):
+    d = np.abs(H - h0)
+    return np.minimum(d, 360 - d)
+
+
+def _circ_median(H):
+    """Median of hue angles (degrees), robust to the -180/180 wrap."""
+    r = np.radians(H)
+    h0 = np.degrees(np.arctan2(np.sin(r).mean(), np.cos(r).mean()))
+    dev = (H - h0 + 180) % 360 - 180
+    return float((h0 + np.median(dev) + 180) % 360 - 180)
+
+
+def _otsu(vals, lo, hi):
+    """Otsu threshold of a 1-D array of chroma / brightness values, clipped to [lo, hi]."""
+    if len(vals) < 20:
+        return lo
+    v = np.clip(vals, 0, 255).astype(np.uint8).reshape(-1, 1)
+    t, _ = cv2.threshold(v, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return float(min(max(t, lo), hi))
+
+
+def _disk(r):
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+
+
+def _box(r):
+    """Square kernel: OpenCV dilates with it many times faster than with a disk."""
+    return np.ones((2 * r + 1, 2 * r + 1), np.uint8)
+
+
+def _fill(mask):
+    """Fill holes (chalk, bolt holes, highlights inside a hold)."""
+    cs, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = np.zeros_like(mask)
+    cv2.drawContours(out, cs, -1, 1, -1)
+    return out
+
+
+def _component_at(cand, cx, cy, reach):
+    """The blob of `cand` under (cx, cy), or the biggest one within `reach` px of it."""
+    n, lbl = cv2.connectedComponents(cand, connectivity=8)
+    l = lbl[cy, cx]
+    if l == 0:
+        y0, y1, x0, x1 = max(0, cy - reach), cy + reach + 1, max(0, cx - reach), cx + reach + 1
+        near = lbl[y0:y1, x0:x1]
+        near = near[near > 0]
+        if not len(near):
+            return None
+        l = np.bincount(near).argmax()
+    return _fill((lbl == l).astype(np.uint8))
+
+
+def _grow_seed(fc, x, y, cand_fn, hull_reach=0.0):
+    """Segment the hold under (x, y) inside a box that grows until the blob fits in it.
+    cand_fn(slices) -> uint8 0/1 candidate pixels in that box. Returns a full-size mask, or
+    None if nothing is under the click or the blob runs off as far as we look (bare wall,
+    a wall panel, a volume face). hull_reach > 0: a click up to that far (x the frame's
+    short side) outside the blob still counts if it's inside the blob's convex hull - a
+    chalk cap or highlight on the hold's edge - and the hull becomes the seed."""
+    m = fc.mind
+    k = _disk(max(2, int(m * 0.006)))                   # bridges chalk / highlights / bolt holes
+    reach = max(2, int(m * max(0.012, hull_reach)))
+    for frac in (0.1, 0.2, 0.35):
+        R = int(m * frac)
+        y0, y1, x0, x1 = max(0, y - R), min(fc.h, y + R + 1), max(0, x - R), min(fc.w, x + R + 1)
+        cand = cv2.morphologyEx(cand_fn((slice(y0, y1), slice(x0, x1))), cv2.MORPH_CLOSE, k)
+        comp = _component_at(cand, x - x0, y - y0, reach)
+        if comp is None:
+            return None
+        if not comp[y - y0, x - x0]:
+            cs, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            hull = cv2.convexHull(max(cs, key=cv2.contourArea))
+            if not hull_reach or cv2.pointPolygonTest(hull, (float(x - x0), float(y - y0)), False) < 0:
+                return None
+            cv2.fillPoly(comp, [hull], 1)
+        rows, cols = np.any(comp, 1), np.any(comp, 0)
+        runs_off = ((rows[0] and y0 > 0) or (rows[-1] and y1 < fc.h) or
+                    (cols[0] and x0 > 0) or (cols[-1] and x1 < fc.w))
+        if not runs_off:
+            full = np.zeros((fc.h, fc.w), np.uint8)
+            full[y0:y1, x0:x1] = comp
+            return full
+    return None
+
+
+def _seed_colour(fc, x, y):
+    """Clicked hold has a colour: find it from the colourful pixels nearest the click (so a
+    click on chalk or a highlight still reads the hold's colour), then segment it."""
+    m = fc.mind
+    # (radius, share of colourful pixels needed, hull reach): first look right at the click;
+    # failing that, a bigger area with only a little colour - a click on a chalk cap or a
+    # highlight that covers much of the hold - accepted only if the click is inside the hold
+    for r, share, hull_reach in ((0.012, 0.15, 0), (0.025, 0.15, 0), (0.045, 0.15, 0.03), (0.06, 0.05, 0.04)):
+        R = max(4, int(m * r))
+        y0, x0 = max(0, y - R), max(0, x - R)
+        C, H = fc.C[y0:y + R + 1, x0:x + R + 1], fc.H[y0:y + R + 1, x0:x + R + 1]
+        yy, xx = np.mgrid[y0:y0 + C.shape[0], x0:x0 + C.shape[1]]
+        d2 = (yy - y) ** 2 + (xx - x) ** 2
+        col = (d2 <= R * R) & (C >= COLOURFUL)
+        if col.sum() < max(12, share * (d2 <= R * R).sum()):
+            continue
+        near = np.argsort(d2[col])[:max(12, int(col.sum()) // 3)]
+        hue, c_click = _circ_median(H[col][near]), float(np.median(C[col][near]))
+        # hold vs wall pixels of this hue: Otsu first; if that lets a tinted wall in (the
+        # blob runs off), retry with a cut-off close to the hold's own chroma
+        for hi in (0.6, 0.8):
+            def cand(sl, hi=hi):
+                C, dh = fc.C[sl], _hue_diff(fc.H[sl], hue)
+                band = dh <= SEED_HUE
+                thr = _otsu(C[band], 8, max(8, hi * c_click)) if hi < 0.7 else max(8, hi * c_click)
+                return (band & (C >= thr)).astype(np.uint8)
+            seed = _grow_seed(fc, x, y, cand, hull_reach)
+            if seed is not None:
+                return seed, hue
+        if r >= 0.045:
+            break
+    return None
+
+
+def _seed_grey(fc, x, y):
+    """Clicked hold has no colour (white / grey / black): segment it by brightness against
+    the wall around it. None if it's as bright as the wall (= probably bare wall)."""
+    m = fc.mind
+    r = max(3, int(m * 0.01))
+    L0 = float(np.median(fc.L[max(0, y - r):y + r + 1, max(0, x - r):x + r + 1]))
+
+    def cand(sl):
+        L = fc.L[sl]
+        Lw = float(np.median(L))
+        if abs(L0 - Lw) < GREY_CONTRAST:
+            return np.zeros(L.shape, np.uint8)
+        T = (L0 + Lw) / 2
+        return (((L >= T) if L0 > Lw else (L <= T)) & (fc.C[sl] < max(COLOURFUL * 1.5, 18))).astype(np.uint8)
+    seed = _grow_seed(fc, x, y, cand)
+    if seed is None:
+        return None
+    # a hold is a compact blob; a ragged patch of chalk dust / lighter wall is not
+    cs, _ = cv2.findContours(seed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    c = max(cs, key=cv2.contourArea)
+    return seed if cv2.contourArea(c) >= 0.6 * cv2.contourArea(cv2.convexHull(c)) else None
+
+
+def hold_model(fc, x, y, frame=None):
+    """Colour model of the hold under an AUTO click (JSON-friendly dict). Has a "reject"
+    key with a message for the user when the click isn't on a hold."""
+    x, y = int(min(max(x, 0), fc.w - 1)), int(min(max(y, 0), fc.h - 1))
+    base = {"click": [x, y], "frame": frame}
+    if fc.person()[y, x]:
+        return dict(base, reject="person", message="That's the climber, not a hold. Click a hold.")
+    s = _seed_colour(fc, x, y)
+    kind = "colour"
+    if s is not None:
+        seed, hue = s
+    else:
+        seed, kind = _seed_grey(fc, x, y), "grey"
+    if seed is None:
+        return dict(base, reject="wall",
+                    message="No hold found there (it looks like bare wall). Click on a hold, "
+                            "or use manual mode for a hold that blends into the wall.")
+    seed &= 1 - fc.person()                           # a hand on the hold isn't part of it
+    if kind == "colour":
+        # now that the hold's own hue is known (from the whole hold, not the click), cut off
+        # any neighbouring hold of a nearby hue the first pass took in; chalk / highlight
+        # pixels (no colour) stay.
+        hue, hue_tol, _ = _colour_stats(fc, seed, hue)
+        ok = (_hue_diff(fc.H, hue) <= max(hue_tol, 10)) | (fc.C < COLOURFUL)
+        seed = _component_at((seed & ok).astype(np.uint8), x, y, max(2, int(fc.mind * 0.012)))
+        if seed is None:
+            return dict(base, reject="wall", message="No hold found there. Click on a hold.")
+    area = int(seed.sum())
+    if area < 20:
+        return dict(base, reject="wall", message="No hold found there. Click on a hold.")
+    # smooth the outline (marbled / chalky holds leave notches); a nearly convex hold gets its
+    # convex hull, which also fills a notch where chalk or a highlight sat on its edge
+    seed = _fill(cv2.morphologyEx(seed, cv2.MORPH_CLOSE, _disk(max(2, int(0.06 * np.sqrt(area))))))
+    cs, _ = cv2.findContours(seed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    c = max(cs, key=cv2.contourArea)
+    hull = cv2.convexHull(c)
+    if cv2.contourArea(c) >= 0.8 * cv2.contourArea(hull):
+        seed = np.zeros_like(seed)
+        cv2.fillPoly(seed, [hull], 1)
+        seed &= 1 - fc.person()
+    area = int(seed.sum())
+    # the wall around it: a ring that starts a little way out (the hold's blurred edge isn't wall)
+    k_in, k = max(3, int(fc.mind * 0.008)), max(12, int(0.4 * np.sqrt(area)))
+    around = (cv2.dilate(seed, _disk(k_in + k)) > 0) & (cv2.dilate(seed, _disk(k_in)) == 0) & (fc.person() == 0)
+    if kind == "colour":
+        hue, hue_tol, clean = _colour_stats(fc, seed, hue)
+        Cc, Lc = fc.C[clean], fc.L[clean]
+        # how colourful the wall is in this hold's colour direction: chroma projected on the
+        # hold's hue, upper quartile over the ring (robust to a neighbouring hold in the ring)
+        along = fc.C[around] * np.cos(np.radians(_hue_diff(fc.H[around], hue)))
+        c_wall = float(np.percentile(np.maximum(along, 0), 80)) if len(along) >= 30 else 4.0
+        # ... and anywhere in the picture (mats, wood panels, a painted wall): the hold's
+        # colour may only occur on a small part of it, so its 85th percentile is "background"
+        step = max(1, int(np.sqrt(fc.h * fc.w / 250000)))          # subsample: ~250k pixels
+        bg = (fc.person()[::step, ::step] == 0) & (seed[::step, ::step] == 0)
+        along_all = fc.C[::step, ::step][bg] * np.cos(np.radians(_hue_diff(fc.H[::step, ::step][bg], hue)))
+        c_wall = max(c_wall, float(np.percentile(np.maximum(along_all, 0), 85)))
+        L10, L50, L90 = (float(v) for v in np.percentile(Lc, [10, 50, 90]))
+        half = max(40.0, 0.75 * (L90 - L10))         # shading range on the clicked hold, padded
+        L_lo, L_hi = L50 - half, L50 + half
+        c_hold = float(np.percentile(Cc, 30))
+        if c_hold < max(c_wall, 4.0) + PALE_MARGIN:
+            # barely more colourful than the wall (cream, off-white, a washed-out pastel):
+            # colour can't separate it, so treat it like a white / grey hold
+            kind = "grey"
+        else:
+            model = dict(base, kind="colour", hue=round(hue, 1), hue_tol=round(hue_tol, 1),
+                         c_hold=round(c_hold, 1), c_wall=round(max(c_wall, 4.0), 1),
+                         c_hi=round(float(np.percentile(Cc, 95)), 1),
+                         L_lo=round(L_lo, 1), L_hi=round(L_hi, 1))
+    if kind == "grey":
+        clean = seed > 0
+        L0 = float(np.median(fc.L[clean]))
+        Lw = float(np.median(fc.L[around])) if around.any() else float(np.median(fc.wall_L()[clean]))
+        model = dict(base, kind="grey", L=round(L0, 1), L_wall=round(Lw, 1),
+                     c_max=round(float(np.percentile(fc.C[clean], 90)), 1))
+    model["lab"] = [round(float(np.median(fc.lab[..., i][clean])), 1) for i in range(3)]
+    cs, _ = cv2.findContours(seed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    c = max(cs, key=cv2.contourArea)
+    c = cv2.approxPolyDP(c, max(1.0, 0.003 * cv2.arcLength(c, True)), True)
+    model["seed"] = c.reshape(-1, 2).tolist()
+    model["seed_area"] = area
+    return model
+
+
+def _colour_stats(fc, seed, hue):
+    """Hue, hue tolerance and the 'clean' pixels (no chalk, highlight, shadow or other colour)
+    of a segmented coloured hold."""
+    clean = (seed > 0) & (_hue_diff(fc.H, hue) <= SEED_HUE) & (fc.C >= COLOURFUL * 0.75)
+    if clean.sum() < 0.15 * max(seed.sum(), 1):
+        clean = seed > 0
+    hue = _circ_median(fc.H[clean])
+    dev = np.abs((fc.H[clean] - hue + 180) % 360 - 180)
+    hue_tol = float(np.clip(1.5 * np.percentile(dev, 85) + 4, 7, 20))
+    return hue, hue_tol, clean
+
+
+def _legacy_model(fc, s):
+    """An old-style [L, a, b] sample (no clicked hold): match on its colour alone."""
+    L, a, b = s
+    if np.hypot(a - 128, b - 128) < GREY_CHROMA:
+        return {"kind": "grey", "L": L, "L_wall": float(np.median(fc.L)), "c_max": GREY_CHROMA, "lab": list(s)}
+    return {"kind": "colour", "hue": float(np.degrees(np.arctan2(b - 128, a - 128))), "hue_tol": 12.0,
+            "c_hold": float(np.hypot(a - 128, b - 128)) * 0.8, "c_wall": 6.0, "lab": list(s)}
+
+
+def models_for_frame(models, frame):
+    """Models to use on `frame`: a model's clicked-hold outline only applies on the frame it
+    was clicked on; elsewhere just its colour is used."""
+    return [m if m.get("frame") == frame else {k: v for k, v in m.items() if k != "seed"} for m in models]
+
+
+def _tight(tol):
+    """Tolerance slider -> 0..1: where between the wall's colour (0) and the hold's own (1)
+    the cut-off sits. Default 22 -> 0.55; a looser slider moves it towards the wall."""
+    return float(np.clip(0.55 * 22 / max(tol, 1), 0.08, 0.95))
+
+
+def match_model(fc, m, tol):
+    """uint8 0/1 mask of pixels matching one model at this tolerance (cached on the frame)."""
+    key = (tol, m["kind"], tuple(m.get("lab", ())), m.get("hue"), m.get("c_wall"), m.get("L_wall"))
+    cache = fc.__dict__.setdefault("_match", {})
+    if key not in cache:
+        if len(cache) > 32:
+            cache.clear()
+        cache[key] = _match_model(fc, m, tol)
+    return cache[key]
+
+
+def _match_model(fc, m, tol):
+    s = tol / 22
+    t = _tight(tol)
+    if m["kind"] == "colour":
+        dh = _hue_diff(fc.H, m["hue"])
+        ht = min(m["hue_tol"] * s, 45)
+        c_min = max(6.0, m["c_wall"] + (m["c_hold"] - m["c_wall"]) * t)
+        strong = (dh <= ht) & (fc.C >= c_min)
+        if "c_hi" in m:              # a pastel hold isn't the saturated one of the same hue
+            strong &= fc.C <= (m["c_hi"] + max(10.0, 0.5 * m["c_hi"])) * max(1.0, s)
+        if "L_lo" in m:              # navy isn't light blue: a loose brightness band as well
+            mid, half = (m["L_lo"] + m["L_hi"]) / 2, (m["L_hi"] - m["L_lo"]) / 2 * max(1.0, s)
+            strong &= np.abs(fc.L - mid) <= half
+        strong = strong.astype(np.uint8)
+        # grow into the hold's shaded / washed-out parts, only where connected to a strong match
+        weak = (dh <= 1.5 * ht) & (fc.C >= max(5.0, m["c_wall"] + (c_min - m["c_wall"]) * 0.5))
+    else:
+        # grey / white / black: how much brighter (darker) than the wall around it, plus a
+        # loose band around the hold's own brightness and little colour
+        L0, Lw = m["L"], m["L_wall"]
+        d0 = L0 - Lw
+        rel = (fc.L - fc.wall_L()) * (1 if d0 >= 0 else -1)
+        c_ok = fc.C <= m["c_max"] + 4 * max(1.0, s)
+        near = np.abs(fc.L - L0) <= max(30.0, 0.8 * abs(d0)) * max(1.0, s)
+        strong = ((rel >= abs(d0) * t) & near & c_ok).astype(np.uint8)
+        weak = (rel >= abs(d0) * t * 0.6) & near & c_ok
+    n, lbl = cv2.connectedComponents((weak | (strong > 0)).astype(np.uint8), connectivity=8)
+    keep = np.zeros(n, bool)
+    keep[np.unique(lbl[strong > 0])] = True
+    keep[0] = False
+    grown = keep[lbl].astype(np.uint8)
+    grown &= cv2.dilate(strong, _box(max(2, int(fc.mind * 0.015))))
+    return grown
+
+
+def find_holds_auto(lab, samples, tol=22, min_area=None, deleted=()):
+    """Every hold matching one of the AUTO models.
+    lab      FrameColour (or a to_lab() array - then no climber masking)
+    samples  hold_model() dicts (old [L, a, b] samples still work, colour only)
+    deleted  outlines (lists of [x, y]) the user deleted: those pixels are cut out, so a
+             deleted hold stays deleted at any tolerance and never takes another hold with it."""
+    fc = lab if isinstance(lab, FrameColour) else FrameColour(lab=lab)
+    h, w = fc.h, fc.w
+    models = [s if isinstance(s, dict) else _legacy_model(fc, s) for s in samples]
+    models = [m for m in models if not m.get("reject")]
+    if not models:
         return []
+    frame_area = _fd(h, w)[1]
     if min_area is None:
-        min_area = int(_fd(h, w)[1] * 0.0003)
-    col = [s for s in samples if np.hypot(s[1] - 128, s[2] - 128) >= GREY_CHROMA]
-    mask = np.zeros((h, w), np.uint8)
-    if col:
-        dist = np.min([colour_distance(lab, s) for s in col], axis=0)
-        strong = clean_mask((dist < tol).astype(np.uint8) * 255, h, w)
-        # Grow each hold into its shaded / sun-lit parts: a looser colour match, but only
-        # where it's connected to a strong match (so a similar-coloured wall isn't pulled in).
-        weak = (dist < GROW * tol).astype(np.uint8)
-        n, lbl = cv2.connectedComponents(weak | (strong > 0), connectivity=8)
-        keep = np.zeros(n, bool)
-        keep[np.unique(lbl[strong > 0])] = True
-        keep[0] = False
-        grown = keep[lbl].astype(np.uint8) * 255
-        # don't let a hold's growth run off far beyond its strong core
-        k = max(3, int(_fd(h, w)[0] * 0.03) | 1)
-        grown &= cv2.dilate(strong, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-        mask = clean_mask(grown, h, w)
-    colour_only = mask.copy()
-    # Grey / white / black holds: the wall is grey too, so colour alone would match the
-    # whole wall. Find them by their outline instead (see outline_arcs).
-    grey_samples = [s for s in samples if np.hypot(s[1] - 128, s[2] - 128) < GREY_CHROMA]
-    if grey_samples:                       # add hold outlines whose inside matches the grey
-        for c, med in outline_arcs(lab):
-            if np.hypot(med[1] - 128, med[2] - 128) >= GREY_CHROMA:
-                continue
-            if min(float(colour_distance(med[None, None, :], s)[0, 0]) for s in grey_samples) < tol:
-                cv2.drawContours(mask, [c], -1, 255, -1)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        min_area = int(frame_area * 0.0003)
+    col, grey, seeds = (np.zeros((h, w), np.uint8) for _ in range(3))
+    seed_areas = []
+    for m in models:
+        mm = match_model(fc, m, tol)
+        if m["kind"] == "colour":
+            col |= mm
+        else:
+            grey |= mm
+        if m.get("seed"):
+            cv2.fillPoly(seeds, [np.array(m["seed"], np.int32)], 1)
+            seed_areas.append(m.get("seed_area", 0))
+    k_open = _disk(max(1, int(fc.mind / 500)))
+    k_close = _disk(max(2, int(fc.mind * 0.006)))          # merges chalk / highlight fragments
+    match = cv2.morphologyEx(cv2.morphologyEx(col | grey, cv2.MORPH_OPEN, k_open), cv2.MORPH_CLOSE, k_close)
+    if fc.img is not None:                                   # the climber is never a hold
+        match &= 1 - fc.person_wide()
+    # the clicked holds: always in, and their blob may only grow a little past the clicked outline
+    if seeds.any():
+        n, lbl = cv2.connectedComponents(match | seeds, connectivity=8)
+        seeded = np.zeros(n, bool)
+        seeded[np.unique(lbl[seeds > 0])] = True
+        seeded[0] = False
+        near_seed = cv2.dilate(seeds, _box(max(3, int(0.15 * np.sqrt(max(seed_areas))))))
+        sl = seeded[lbl]
+        match[sl] = ((match & near_seed) | seeds)[sl]
+    del_mask = np.zeros((h, w), np.uint8)
+    for d in deleted:
+        cv2.fillPoly(del_mask, [np.array(d, np.int32)], 1)
+    if del_mask.any():
+        del_mask = cv2.dilate(del_mask, _box(max(2, int(fc.mind * 0.006))))
+        match &= 1 - del_mask
+        seeds &= 1 - del_mask
+
+    n, lbl, stats, _ = cv2.connectedComponentsWithStats(match, connectivity=8)
+    area = stats[:, cv2.CC_STAT_AREA]
+    # Per-blob statistics below are ratios, so they're counted on every 2nd pixel (4x faster).
+    q = 2 if fc.mind >= 600 else 1
+    lq, mq = lbl[::q, ::q], match[::q, ::q]
+    Cq, Hq = fc.C[::q, ::q], fc.H[::q, ::q]
+    area_q = np.maximum(np.bincount(lq.ravel(), minlength=n), 1)
+    # how colourful each blob's surroundings are (a ring a few px out): a highlight or chalk
+    # patch on a coloured hold, or a shaded corner of a different-shade hold, is surrounded by
+    # colour; a real hold is surrounded by wall.
+    r1 = max(1, int(fc.mind * 0.005) // q)
+    near = cv2.dilate(mq, _box(r1))
+    lbl_far = cv2.dilate(lq.astype(np.float32), _box(3 * r1)).astype(np.int32)
+    ring = (lbl_far > 0) & (near == 0)
+    rl = lbl_far[ring]
+    n_ring = np.bincount(rl, minlength=n)
+    # ... counting only colour close to the blob's own hue (a neighbouring hold of another
+    # colour doesn't make a blob a fragment), or any colour at all for grey blobs
+    on = lq > 0
+    lo = lq[on]
+    a_, b_ = fc.lab[::q, ::q, 1][on] - 128, fc.lab[::q, ::q, 2][on] - 128
+    blob_hue = np.degrees(np.arctan2(np.bincount(lo, b_, n), np.bincount(lo, a_, n)))
+    # "colourful" = clearly above the wall's chroma for these colours (min 8)
+    c_walls = [m["c_wall"] for m in models if m["kind"] == "colour"]
+    c_ring = max(8.0, min(c_walls, default=8.0) + 4)
+    Cr = Cq[ring]
+    same = (Cr >= c_ring) & (_hue_diff(Hq[ring], blob_hue[rl]) <= 45)
+    n_ring_col = np.bincount(rl[same], minlength=n)
+    n_ring_any = np.bincount(rl[Cr >= 1.5 * COLOURFUL], minlength=n)
+    n_seed = np.bincount(lbl[seeds > 0], minlength=n)            # full res: a tiny seed must count
+    n_person = (np.bincount(lq[fc.person()[::q, ::q] > 0], minlength=n) if fc.img is not None
+                else np.zeros(n, int))
+    n_grey = (np.bincount(lq[(grey[::q, ::q] > 0) & (col[::q, ::q] == 0)], minlength=n) if grey.any()
+              else np.zeros(n, int))
+    # grey blobs: a real white / black hold stands out from the wall about as much as the
+    # clicked one does over its whole area; chalk smudges and lighter wall patches only just
+    # clear the threshold. Mean contrast per blob, against the weakest grey model.
+    greys = [m for m in models if m["kind"] == "grey"]
+    if greys:
+        d0 = min((m["L"] - m["L_wall"] for m in greys), key=abs)
+        rel = (fc.L[::q, ::q] - fc.wall_L()[::q, ::q])[on] * (1 if d0 >= 0 else -1)
+        mean_rel = np.bincount(lo, rel, n) / area_q
+        need_rel = abs(d0) * min(0.9, _tight(tol) + 0.2)
+    max_area = max(MAX_AREA_FRAC * frame_area, SEED_AREA_MULT * max(seed_areas, default=0))
     holds = []
-    for c in contours:
-        area = cv2.contourArea(c)
-        x, y = c[0][0]
-        strict = colour_only[y, x] == 0                                       # grey hold (from outlines)
-        if min_area <= area <= 0.03 * _fd(h, w)[1] and _hold_shaped(c, area, strict):   # skip specks, wall patches, strips
-            hold = contour_to_hold(c, "auto")
-            if hold:
-                holds.append(hold)
+    for i in range(1, n):
+        is_seed = n_seed[i] > 0
+        if not is_seed:
+            if area[i] < min_area * 0.5 or area[i] > max_area * 1.2 or n_person[i] > PERSON_OVERLAP * area_q[i]:
+                continue
+            grey_blob = n_grey[i] > 0.5 * area_q[i]     # a highlight / chalk patch on a coloured hold
+            if (n_ring_any if grey_blob else n_ring_col)[i] > FRAGMENT_RING * max(n_ring[i], 1):
+                continue
+            if grey_blob and greys and mean_rel[i] < need_rel:
+                continue
+        x, y, bw, bh = stats[i, :4]
+        sub = (lbl[y:y + bh, x:x + bw] == i).astype(np.uint8)
+        cs, _ = cv2.findContours(sub, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        c = max(cs, key=cv2.contourArea) + np.array([x, y])
+        a = cv2.contourArea(c)                               # holes filled
+        strict = n_grey[i] > 0.5 * area_q[i]                 # grey matches: wall patches look alike
+        if not is_seed and not (min_area <= a <= max_area and _hold_shaped(c, a, strict)):
+            continue
+        hold = contour_to_hold(c, "auto")
+        if hold:
+            holds.append(hold)
     return holds
 
 
@@ -516,8 +974,8 @@ def _interactive(reader, start_frame, fixed_img=None, fixed_label=None):
         sys.exit("Could not read the video")
     h, w = img.shape[:2]
     fit = min(VIEW_W / w, VIEW_H / h)               # zoom level that shows the whole frame
-    r = max(3, _fd(h, w)[0] // 200)
-    S = {"img": img, "lab": to_lab(img), "frame": start_frame, "mode": "AUTO",
+    fc0 = FrameColour(img)
+    S = {"img": img, "fc": fc0, "lab": fc0.lab, "frame": start_frame, "mode": "AUTO",
          "samples": [], "clicks": [], "manual": [], "deleted": [], "history": [],
          "starts": [], "end": None, "tag": None, "msg": "", "poly": [],
          "vols_auto": cvol.detect_volumes(img), "vols_manual": [], "vols_deleted": [], "vols": [],
@@ -633,9 +1091,16 @@ def _interactive(reader, start_frame, fixed_img=None, fixed_label=None):
             tag_hold(fx, fy)
         elif event == cv2.EVENT_LBUTTONDOWN:
             if S["mode"] == "AUTO":
-                S["samples"].append(sample_lab(S["lab"], fx, fy, r))
-                S["clicks"].append([fx, fy])
-                S["history"].append("sample")
+                if any(inside(hd, (fx, fy)) for hd in S["holds"]):
+                    S["msg"] = "That hold is already selected - nothing added."
+                else:
+                    model = hold_model(S["fc"], fx, fy, frame=S["frame"])
+                    if model.get("reject"):
+                        S["msg"] = model["message"]
+                    else:
+                        S["samples"].append(model)
+                        S["clicks"].append([fx, fy])
+                        S["history"].append("sample")
             else:
                 hold = outline_one_hold_img(S["img"], fx, fy) or outline_one_hold(S["lab"], fx, fy)
                 if hold:
@@ -647,8 +1112,10 @@ def _interactive(reader, start_frame, fixed_img=None, fixed_label=None):
                     S["history"].append(("unmanual", S["manual"].pop(i)))
                     break
             else:
-                if any(inside(hd, (fx, fy)) for hd in S["holds"]):
-                    S["deleted"].append([fx, fy])
+                hits = [hd for hd in S["holds"] if inside(hd, (fx, fy))]
+                if hits:                                # remember its OUTLINE, not just the point
+                    hit = min(hits, key=lambda hd: hd["area"])
+                    S["deleted"].append({"pt": [fx, fy], "contour": hit["contour"]})
                     S["history"].append("deleted")
                 else:
                     for i, v in enumerate(S["vols_manual"]):
@@ -757,17 +1224,19 @@ def _interactive(reader, start_frame, fixed_img=None, fixed_label=None):
             if f_idx != S["frame"]:
                 f = reader.read(f_idx)
                 if f is not None:
-                    S.update(img=f, lab=to_lab(f), frame=f_idx, dirty=True,
+                    fcf = FrameColour(f)
+                    S.update(img=f, fc=fcf, lab=fcf.lab, frame=f_idx, dirty=True,
                              vols_auto=cvol.detect_volumes(f))
         tol = max(1, cv2.getTrackbarPos("Colour tol", WIN))
         min_area = int(_fd(h, w)[1] * cv2.getTrackbarPos("Min size", WIN) / 10000)
-        auto_key = (S["frame"], len(S["samples"]), tol, min_area)
+        auto_key = (S["frame"], len(S["samples"]), len(S["deleted"]), tol, min_area)
         if auto_key != S["auto_key"]:
-            S["auto"] = find_holds_auto(S["lab"], S["samples"], tol, min_area)
+            S["auto"] = find_holds_auto(S["fc"], models_for_frame(S["samples"], S["frame"]), tol, min_area,
+                                        deleted=[d["contour"] for d in S["deleted"]])
             S["auto_key"] = auto_key
             S["dirty"] = True
         if S["dirty"]:
-            S["holds"] = combine(S["auto"], S["manual"], S["deleted"], S["starts"], S["end"])
+            S["holds"] = combine(S["auto"], S["manual"], [], S["starts"], S["end"])
             vols = [dict(v) for v in S["vols_auto"]
                     if not any(cvol.inside_volume(v, p) for p in S["vols_deleted"])]
             # painted volumes that aren't the route's colour are off-route (manual ones always kept)
@@ -817,7 +1286,9 @@ def _interactive(reader, start_frame, fixed_img=None, fixed_label=None):
             if n_start == 0 or n_end == 0:
                 print(f"  Note: {n_start} start / {n_end} end holds tagged (press S / E to tag them).")
             info = {"frame": S["frame"], "colour_tol": tol, "min_area_px": min_area,
-                    "colour_samples_lab": S["samples"], "clicks": S["clicks"], "deleted_points": S["deleted"],
+                    "colour_samples_lab": [m["lab"] for m in S["samples"]], "colour_models": S["samples"],
+                    "clicks": S["clicks"], "deleted_points": [d["pt"] for d in S["deleted"]],
+                    "deleted_outlines": [d["contour"] for d in S["deleted"]],
                     "volumes": S["vols"]}
             return S["img"], S["holds"], info
         if key in (27, ord("q")):
@@ -866,15 +1337,26 @@ def main():
 
     if args.pick:
         img = median_wall(video) if args.median else FrameReader(video).read(args.frame)
-        lab = to_lab(img)
-        r = max(3, min(img.shape[:2]) // 200)
+        fc = FrameColour(img)
+        lab = fc.lab
         clicks = [[int(v) for v in p.split(",")] for p in args.pick.split(";")]
-        samples = [sample_lab(lab, x, y, r) for x, y in clicks]
-        holds = combine(find_holds_auto(lab, samples), [], [])
+        models = []
+        for x, y in clicks:                  # same rules as clicking in the window
+            if any(inside(hd, (x, y)) for hd in find_holds_auto(fc, models)):
+                print(f"  click {x},{y}: that hold is already selected - nothing added.")
+                continue
+            m = hold_model(fc, x, y, frame=args.frame)
+            if m.get("reject"):
+                print(f"  click {x},{y}: {m['message']}")
+            else:
+                models.append(m)
+        holds = combine(find_holds_auto(fc, models), [], [])
+        samples = [m["lab"] for m in models]
         vols, _ = filter_coloured_volumes(lab, cvol.detect_volumes(img), holds)
         vols = cvol.cut_foreign_holds(vols, img, route_mask(holds, img.shape),
                                       int(img.shape[0] * img.shape[1] * 0.0003))
-        info = {"frame": args.frame, "colour_samples_lab": samples, "clicks": clicks, "volumes": vols}
+        info = {"frame": args.frame, "colour_samples_lab": samples, "colour_models": models, "clicks": clicks,
+                "volumes": vols}
     else:
         reader = FrameReader(video)
         fixed = median_wall(video) if args.median else None

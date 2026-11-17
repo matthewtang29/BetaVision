@@ -200,8 +200,8 @@ function goToFrame(i) {
 }
 
 // ---------- keyframes (camera moved): a few frames that between them show the whole wall
-const hasMarks = (f) => [P.auto, P.manual, P.vols_manual].some((list) => list.some((c) => c.frame === f)) ||
-  [P.deleted, P.starts, P.vols_deleted, P.end ? [P.end] : []].some((list) => list.some((p) => p[2] === f));
+const hasMarks = (f) => [P.auto, P.manual, P.vols_manual, P.deleted].some((list) => list.some((c) => c.frame === f)) ||
+  [P.starts, P.vols_deleted, P.end ? [P.end] : []].some((list) => list.some((p) => p[2] === f));
 
 function renderStrip() {
   if (!P.frames) return;
@@ -421,6 +421,10 @@ function finishPoly() {
 }
 
 function onClick(pt, right) {
+  if (!right && !tag && mode === "AUTO" && holds.some((h) => inside(h, pt))) {
+    flash("That hold is already selected, so nothing was added.");   // a new sample would only widen the match
+    return;
+  }
   pinFrame();
   if (!right && tag === "poly") {
     if (poly.length >= 3 && Math.hypot(pt[0] - poly[0][0], pt[1] - poly[0][1]) < 18 / view.s) return finishPoly();
@@ -440,7 +444,10 @@ function onClick(pt, right) {
       history.push(["unmanual", P.manual[m.manual_index], m.manual_index]);
       P.manual.splice(m.manual_index, 1);
     } else if (holds.some((h) => inside(h, pt))) {
-      P.deleted.push([...pt, P.frame]); history.push("deleted");
+      // remember the hold's OUTLINE (on this frame), so it stays deleted whatever the tolerance
+      // or colour samples do later, and never takes a different hold with it
+      const hit = holds.filter((h) => inside(h, pt)).reduce((a, b) => ((a.area || 0) <= (b.area || 0) ? a : b));
+      P.deleted.push({ x: pt[0], y: pt[1], frame: P.frame, contour: hit.contour }); history.push("deleted");
     } else if (mv) {
       history.push(["unvol", P.vols_manual[mv.manual_index], mv.manual_index]);
       P.vols_manual.splice(mv.manual_index, 1);
@@ -492,6 +499,16 @@ function refreshRoute() {
           if (at >= 0) history.splice(at, 1);
         });
         flash("Couldn't find a volume there. Try its middle, or trace its corners (P).");
+        return refreshRoute();
+      }
+      if (data.rejected_auto && data.rejected_auto.length) {   // an AUTO click that wasn't on a hold
+        data.rejected_auto.slice().reverse().forEach(({ index }) => {
+          P.auto.splice(index, 1);
+          const at = history.lastIndexOf("sample");
+          if (at >= 0) history.splice(at, 1);
+        });
+        flash(data.rejected_auto[data.rejected_auto.length - 1].message);
+        renderStrip();
         return refreshRoute();
       }
       holds = data.holds; vols = data.volumes; skippedVols = data.skipped_volumes;

@@ -24,6 +24,7 @@ import sys
 import threading
 import traceback
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -62,7 +63,8 @@ class Job:
         self.state, self.stage, self.message, self.progress = "uploading", "", "", 0.0
         self.results = None
         self.lock = threading.Lock()   # cv2.VideoCapture isn't thread-safe
-        self.cache = {}                # picture labs, auto volumes, manual outlines
+        self.cache = {}                # auto volumes, manual outlines, hold models
+        self.fcs = OrderedDict()       # per-frame colour data (big: only the last few frames)
         self.cam, self.moved, self.keyframes = None, 0.0, None   # keyframes: set when the camera moved a lot
 
     # ---------------------------------------------------------------- open + follow the camera
@@ -117,8 +119,20 @@ class Job:
 
     # ---------------------------------------------------------------- the picker's picture
     def frame(self, i):
+        """Frame i (BGR). The last few are kept decoded: a keyframe refresh needs every
+        keyframe several times, and seeking a phone video costs ~0.2 s a frame."""
+        i = max(0, min(int(i), self.reader.total - 1))
         with self.lock:
-            return self.reader.read(max(0, min(int(i), self.reader.total - 1)))
+            cache = self.__dict__.setdefault("decoded", OrderedDict())
+            if i in cache:
+                cache.move_to_end(i)
+                return cache[i]
+            img = self.reader.read(i)
+            if img is not None:
+                cache[i] = img
+                while len(cache) > max(8, len(self.keyframes or []) + 3):
+                    cache.popitem(last=False)
+            return img
 
     def picture_jpeg(self, i, width=None):
         img = self.frame(i)
@@ -135,31 +149,69 @@ class Job:
             self.cache[key] = fn()
         return self.cache[key]
 
+    def fc(self, i):
+        """climb_holds.FrameColour of frame i (Lab, hue, chroma, climber mask), kept for the
+        last few frames only: each is ~60 MB at 1080p."""
+        i = int(i)
+        with self.lock:
+            hit = self.fcs.get(i)
+            if hit is not None:
+                self.fcs.move_to_end(i)
+                return hit
+        fc = ch.FrameColour(self.frame(i))
+        with self.lock:
+            self.fcs[i] = fc
+            while len(self.fcs) > max(8, len(self.keyframes or []) + 2):
+                self.fcs.popitem(last=False)
+        return fc
+
     def lab(self, i):
-        return self.cached(("lab", int(i)), lambda: ch.to_lab(self.frame(i)))
+        return self.fc(i).lab
+
+    def models(self, st, cur):
+        """AUTO clicks -> hold models (one per click, cached). Clicks that aren't on a hold
+        come back in `rejected` as {index, message} so the page can drop them again."""
+        models, rejected = [], []
+        for k, c in enumerate(st.get("auto", [])):
+            f, x, y = int(c.get("frame", cur)), int(c["x"]), int(c["y"])
+            m = self.cached(("model", f, x, y), lambda f=f, x=x, y=y: ch.hold_model(self.fc(f), x, y, frame=f))
+            if m.get("reject"):
+                rejected.append({"index": k, "message": m["message"]})
+            elif any(o["frame"] == f and o.get("seed") and ch.inside({"contour": o["seed"]}, (x, y)) for o in models):
+                # a second click on a hold that's already a sample (the page checks this too, but
+                # only once the first click's outlines have come back)
+                rejected.append({"index": k, "message": "That hold is already selected, so nothing was added."})
+            else:
+                models.append(m)
+        return models, rejected
 
     # ---------------------------------------------------------------- route (same steps as the picker window)
     def build_route(self, st):
         """st = the browser's picker state:
              frame, tol, min_size        current frame and the two picker sliders
              frames [i, ...]             keyframes the route is marked on (camera moved a lot)
-             auto   [{x, y, frame}]      AUTO clicks (colour samples, taken on the frame clicked)
+             auto   [{x, y, frame}]      AUTO clicks (each one's hold is outlined and its colour
+                                         modelled on the frame clicked; see climb_holds.hold_model)
              manual [{x, y, frame}]      MANUAL clicks (one hold each, outlined on the frame clicked)
-             deleted [[x, y, frame]], starts [[x, y, frame]], end [x, y, frame] or null
+             deleted [{x, y, frame, contour}]  right-clicked holds' outlines (old: [x, y, frame])
+             starts [[x, y, frame]], end [x, y, frame] or null
              vols_manual [{kind: "click", x, y, frame} | {kind: "poly", points, frame}], vols_deleted [[x, y, frame]]
-        Returns (img, holds, vols, info, extra) like climb_holds.interactive, plus counts for the page.
+        Returns (img, holds, vols, info, extra) like climb_holds.interactive, plus counts for the page
+        and rejected_auto ([{index, message}]: AUTO clicks that weren't on a hold).
         With keyframes, holds + volumes come back in BASE-frame pixels (img = the base frame)."""
         if self.keyframes:
             return self._build_route_keyframes(st)
         frame = int(st.get("frame", 0))
         img = self.frame(frame)
         h, w = img.shape[:2]
-        r = max(3, ch._fd(h, w)[0] // 200)
-        lab = self.lab(frame)
-        samples = [ch.sample_lab(self.lab(c["frame"]), int(c["x"]), int(c["y"]), r) for c in st.get("auto", [])]
+        fc = self.fc(frame)
+        lab = fc.lab
+        models, rejected = self.models(st, frame)
         tol = max(1, int(st.get("tol", 22)))
         min_area = int(ch._fd(h, w)[1] * int(st.get("min_size", 3)) / 10000)
-        auto = ch.find_holds_auto(lab, samples, tol, min_area)
+        outlines, points = split_deleted(st.get("deleted"), frame)
+        auto = ch.find_holds_auto(fc, ch.models_for_frame(models, frame), tol, min_area,
+                                  deleted=[c for _, c in outlines])
 
         manual = []
         for k, c in enumerate(st.get("manual", [])):
@@ -170,7 +222,7 @@ class Job:
             if hold:
                 manual.append(dict(hold, manual_index=k))      # lets the page undo / right-click this click
         starts = [p[:2] for p in st.get("starts", [])]
-        holds = ch.combine(auto, manual, [p[:2] for p in st.get("deleted", [])], starts,
+        holds = ch.combine(auto, manual, [p[:2] for p in points], starts,
                            st["end"][:2] if st.get("end") else None)
         mark_starts(holds, starts)
 
@@ -186,10 +238,12 @@ class Job:
             else:
                 vols.append(dict(vol, manual_index=k))
         vols = cvol.cut_foreign_holds(cvol.renumber(vols), img, ch.route_mask(holds, img.shape), min_area)
-        info = {"frame": frame, "colour_tol": tol, "min_area_px": min_area, "colour_samples_lab": samples,
+        info = {"frame": frame, "colour_tol": tol, "min_area_px": min_area,
+                "colour_samples_lab": [m["lab"] for m in models], "colour_models": models,
                 "clicks": [[c["x"], c["y"]] for c in st.get("auto", [])], "deleted_points": st.get("deleted", []),
                 "volumes": vols}
-        return img, holds, vols, info, {"skipped_volumes": len(skipped), "failed_volumes": failed}
+        return img, holds, vols, info, {"skipped_volumes": len(skipped), "failed_volumes": failed,
+                                        "rejected_auto": rejected}
 
     def _manual_volume(self, v):
         if v.get("kind") == "poly":
@@ -212,14 +266,21 @@ class Job:
         frames |= {on(c) for key in ("auto", "manual", "vols_manual") for c in st.get(key, [])}
         frames = sorted(f for f in frames if 0 <= f < len(self.cam))
 
-        r = max(3, ch._fd(h, w)[0] // 200)
-        samples = [ch.sample_lab(self.lab(on(c)), int(c["x"]), int(c["y"]), r) for c in st.get("auto", [])]
+        models, rejected = self.models(st, cur)
         tol = max(1, int(st.get("tol", 22)))
         min_area = int(ch._fd(h, w)[1] * int(st.get("min_size", 3)) / 10000)
-        key = (tuple(map(tuple, samples)), tol, min_area)
+        outlines, points = split_deleted(st.get("deleted"), cur)
+
+        def deleted_on(f):                                 # deleted outlines, moved into frame f's pixels
+            return [cm.warp_points(c, self.cam[f] @ np.linalg.inv(self.cam[src])).tolist() for src, c in outlines]
+        key = (tuple((on(c), int(c["x"]), int(c["y"])) for c in st.get("auto", [])), tol, min_area,
+               tuple((src, len(c), tuple(c[0])) for src, c in outlines))
         with ThreadPoolExecutor(max_workers=4) as ex:      # OpenCV releases the GIL, so keyframes run side by side
             autos = list(ex.map(lambda f: self.cached(("auto", f, key), lambda: ch.find_holds_auto(
-                self.lab(f), samples, tol, min_area)), frames))
+                self.fc(f), ch.models_for_frame(models, f), tol, min_area, deleted=deleted_on(f))), frames))
+        clicks = [(on(c), [int(c["x"]), int(c["y"])]) for c in st.get("auto", [])]
+        autos = self.cached(("agree", tuple(frames), key), lambda: agree_across_keyframes(
+            frames, autos, self.cam, (h, w), clicks, lambda f: self.fc(f).person()))
         cands = [(edge_room(hd["contour"], w, h), f, hd) for f, holds_f in zip(frames, autos) for hd in holds_f]
         auto = [b for _, _, b in merge_views(cands, to_base, ca.warp_holds, ch.inside)]
 
@@ -231,7 +292,7 @@ class Job:
             if hold:
                 manual.append(dict(ca.warp_holds([hold], to_base(f))[0], manual_index=k))
         starts = [pt_base(p) for p in st.get("starts", [])]
-        holds = ch.combine(auto, manual, [pt_base(p) for p in st.get("deleted", [])], starts,
+        holds = ch.combine(auto, manual, [pt_base(p) for p in points], starts,
                            pt_base(st["end"]) if st.get("end") else None)
         mark_starts(holds, starts)
 
@@ -265,9 +326,11 @@ class Job:
                         if not any(cvol.inside_volume(o, center(ca.warp_volumes([v], to_base(f))[0]["contour"])) for o in vols))
 
         info = {"frame": self.base, "keyframes": frames, "colour_tol": tol, "min_area_px": min_area,
-                "colour_samples_lab": samples, "clicks": [[c["x"], c["y"], on(c)] for c in st.get("auto", [])],
+                "colour_samples_lab": [m["lab"] for m in models], "colour_models": models,
+                "clicks": [[c["x"], c["y"], on(c)] for c in st.get("auto", [])],
                 "deleted_points": st.get("deleted", []), "volumes": vols}
-        return self.frame(self.base), holds, vols, info, {"skipped_volumes": n_skipped, "failed_volumes": failed}
+        return self.frame(self.base), holds, vols, info, {"skipped_volumes": n_skipped, "failed_volumes": failed,
+                                                          "rejected_auto": rejected}
 
     def preview(self, st):
         _, holds, vols, _, extra = self.build_route(st)
@@ -296,6 +359,21 @@ class Job:
                 "info": self.info() if self.state == "picking" else None}
 
 
+def split_deleted(entries, cur):
+    """Right-click deletions: {x, y, frame, contour} (the hold's outline, stays deleted at any
+    tolerance) or the old [x, y, frame] points. Returns ([(frame, outline)], [[x, y, frame]])."""
+    outlines, points = [], []
+    for d in entries or []:
+        if isinstance(d, dict):
+            if d.get("contour"):
+                outlines.append((int(d.get("frame", cur)), d["contour"]))
+            else:
+                points.append([d["x"], d["y"], int(d.get("frame", cur))])
+        else:
+            points.append(list(d))
+    return outlines, points
+
+
 def center(contour):
     return np.mean(np.asarray(contour, float), axis=0).tolist()
 
@@ -306,6 +384,42 @@ def edge_room(contour, w, h):
     return min(x, y, w - x - bw, h - y - bh)
 
 
+def agree_across_keyframes(frames, autos, cam, size, clicks, person):
+    """Camera moved: a hold found on one keyframe should also be found on the other keyframes
+    that show the same spot (clear of the picture's edge and not hidden by the climber).
+    Drops the ones that fewer than half of those views found: things that move (the climber,
+    a rope, a shadow) or a colour that only matched in one lighting. Clicked holds always stay."""
+    if len(frames) < 2:
+        return autos
+    h, w = size
+    margin = 0.02 * ch._fd(h, w)[0]
+    out = []
+    for i, f in enumerate(frames):
+        kept = []
+        for hd in autos[i]:
+            if any(cf == f and ch.inside(hd, p) for cf, p in clicks):
+                kept.append(hd)
+                continue
+            seen, found = 1, 1
+            for j, g in enumerate(frames):
+                if g == f:
+                    continue
+                hg = ca.warp_holds([hd], cam[g] @ np.linalg.inv(cam[f]))[0]
+                if edge_room(hg["contour"], w, h) < margin:
+                    continue                               # off (or cut by) frame g's edge
+                m = np.zeros((h, w), np.uint8)
+                cv2.fillPoly(m, [np.asarray(hg["contour"], np.int32)], 1)
+                if not m.any() or person(g)[m > 0].mean() > 0.3:
+                    continue                               # the climber hides it on frame g
+                seen += 1
+                c = center(hg["contour"])
+                found += any(ch.inside(o, c) or ch.inside(hg, center(o["contour"])) for o in autos[j])
+            if found >= 0.5 * seen:
+                kept.append(hd)
+        out.append(kept)
+    return out
+
+
 def merge_views(cands, to_base, warp, inside):
     """cands = [(edge_room, frame, item in that frame's pixels)] from several keyframes.
     Returns [(frame, item, item in base pixels)], one per real hold / volume: where views
@@ -313,9 +427,22 @@ def merge_views(cands, to_base, warp, inside):
     out = []
     for _, f, it in sorted(cands, key=lambda t: -t[0]):
         b = warp([it], to_base(f))[0]
-        if not any(inside(o, center(b["contour"])) or inside(b, center(o["contour"])) for _, _, o in out):
+        if not any(inside(o, center(b["contour"])) or inside(b, center(o["contour"])) or same_place(o, b)
+                   for _, _, o in out):
             out.append((f, it, b))
     return out
+
+
+def same_place(a, b):
+    """Two outlines of one object: their convex hulls mostly overlap. (The centre test in
+    merge_views misses crescent / two-lobed holds, whose centre lies outside their own outline.)"""
+    ha = cv2.convexHull(np.asarray(a["contour"], np.float32))
+    hb = cv2.convexHull(np.asarray(b["contour"], np.float32))
+    small = min(cv2.contourArea(ha), cv2.contourArea(hb))
+    if small <= 0:
+        return False
+    inter, _ = cv2.intersectConvexConvex(ha, hb)
+    return inter > 0.5 * small
 
 
 def mark_starts(holds, starts):
