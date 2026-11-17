@@ -16,6 +16,8 @@ The climber moves differently from the wall, so RANSAC throws their points out.
 Everything runs on a half-size copy for speed.
 """
 
+import os
+
 import cv2
 import numpy as np
 
@@ -284,71 +286,123 @@ def lock_on(video, cam, items, ref_frames=None, radius_frac=0.3, step=2, progres
     frame with SIFT features; RANSAC ignores features on the climber, and the fitted motion
     moves the hold.
 
+    The video is streamed once, so memory does not grow with its length: only one greyscale frame
+    is alive at a time (plus a small reference window per hold), and the holds of a frame are
+    matched in parallel threads.
+
     items: outlines in BASE-frame pixels. ref_frames: per item, the frame its outline was traced
-    on (None = the base frame). Returns offsets[frame][item] = (dx, dy) in base pixels."""
-    cap = cv2.VideoCapture(str(video))
+    on (None = the base frame). Returns offsets[frame][item] = (dx, dy) in base pixels.
+    `progress(done, total)` is called per hold once the pass is finished."""
+    from concurrent.futures import ThreadPoolExecutor
     n = len(cam)
-    frames = []
-    while True:
-        ok, f = cap.read()
-        if not ok or len(frames) >= n:
-            break
-        frames.append(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY))
-    cap.release()
-    n = len(frames)
-    H, W = frames[0].shape
+    if n == 0 or not len(items):
+        return np.zeros((n, len(items), 2), np.float32)
+    cams = [np.asarray(c, float) for c in cam]
+    cam_inv = [np.linalg.inv(c) for c in cams]
+    base_i = min(range(n), key=lambda i: np.abs(cams[i] - np.eye(3)).sum())
+    cen = [np.float32(it).mean(axis=0) for it in items]
+    refs = [ref_frames[k] if ref_frames and ref_frames[k] is not None else base_i for k in range(len(items))]
+
+    cap = cv2.VideoCapture(str(video))
+    ok, f0 = cap.read()
+    if not ok:
+        cap.release()
+        return np.zeros((0, len(items), 2), np.float32)
+    H, W = f0.shape[:2]
     r = int(radius_frac * min(H, W))
-    sift = cv2.SIFT_create(1500)
-    bf = cv2.BFMatcher()
-    out = np.zeros((n, len(items), 2), np.float32)
-    base_i = min(range(n), key=lambda i: np.abs(cam[i] - np.eye(3)).sum())
+    ones = np.full((H, W), 255, np.uint8)
 
-    for k, it in enumerate(items):
-        cx, cy = np.float32(it).mean(axis=0)
+    def window(gray, k, i):
+        cx, cy = cen[k]
+        M = np.array([[1, 0, -(cx - r)], [0, 1, -(cy - r)], [0, 0, 1]]) @ cam_inv[i]
+        win = cv2.warpPerspective(gray, M, (2 * r, 2 * r), flags=cv2.INTER_LINEAR)
+        val = cv2.warpPerspective(ones, M, (2 * r, 2 * r), flags=cv2.INTER_NEAREST)
+        return win, (val > 0).astype(np.uint8) * 255
 
-        def window(i):
-            M = np.array([[1, 0, -(cx - r)], [0, 1, -(cy - r)], [0, 0, 1]]) @ np.linalg.inv(cam[i])
-            win = cv2.warpPerspective(frames[i], M, (2 * r, 2 * r), flags=cv2.INTER_LINEAR)
-            val = cv2.warpPerspective(np.full_like(frames[i], 255), M, (2 * r, 2 * r), flags=cv2.INTER_NEAREST)
-            return win, val
+    def in_view(k, i):
+        p = cv2.perspectiveTransform(np.float32([[cen[k]]]), cams[i])[0, 0]
+        return 0 <= p[0] < W and 0 <= p[1] < H
 
-        def in_view(i):
-            p = cv2.perspectiveTransform(np.float32([[[cx, cy]]]), cam[i])[0, 0]
-            return 0 <= p[0] < W and 0 <= p[1] < H
-
-        ref = ref_frames[k] if ref_frames and ref_frames[k] is not None else base_i
-        rw, rv = window(ref)
-        kr, dr = sift.detectAndCompute(rw, (rv > 0).astype(np.uint8) * 255)
-        if dr is None or len(kr) < 20:
+    # pass 1: the reference window of every hold (decode only the reference frames)
+    ref_at = {}
+    for k, rf in enumerate(refs):
+        ref_at.setdefault(rf, []).append(k)
+    ref_feat = {}                                   # k -> (keypoint coords, descriptors)
+    sift0 = cv2.SIFT_create(1500)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    last_ref = max(ref_at)
+    for i in range(min(n, last_ref + 1)):
+        if i not in ref_at:
+            if not cap.grab():
+                break
             continue
-        raw = np.full((n, 2), np.nan, np.float32)
-        raw[ref] = 0
-        for i in range(0, n, step):
-            if i == ref or not in_view(i):
-                continue
-            w_, v_ = window(i)
-            k2, d2 = sift.detectAndCompute(w_, (v_ > 0).astype(np.uint8) * 255)
-            if d2 is None or len(k2) < 10:
-                continue
-            good = [m[0] for m in bf.knnMatch(dr, d2, k=2) if len(m) == 2 and m[0].distance < 0.75 * m[1].distance]
-            if len(good) < 10:
-                continue
-            src = np.float32([kr[m.queryIdx].pt for m in good])
-            dst = np.float32([k2[m.trainIdx].pt for m in good])
-            A, inl = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=4)
-            if A is None or inl.sum() < 12 or inl.mean() < 0.25:
-                continue
-            moved = A @ np.array([r, r, 1.0])
-            shift = moved - r
-            if np.hypot(*shift) < 0.15 * min(H, W):
-                raw[i] = shift
-        good = ~np.isnan(raw[:, 0])
-        idx = np.where(good)[0]
-        if len(idx) >= 2:
-            for d in range(2):
-                col = np.interp(np.arange(n), idx, raw[idx, d])
-                med = np.array([np.median(col[max(0, t - 4):t + 5]) for t in range(n)])
-                out[:, k, d] = [np.mean(med[max(0, t - 2):t + 3]) for t in range(n)]
+        ok, f = cap.read()
+        if not ok:
+            break
+        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+        for k in ref_at[i]:
+            rw, rv = window(g, k, i)
+            kr, dr = sift0.detectAndCompute(rw, rv)
+            if dr is not None and len(kr) >= 20:
+                ref_feat[k] = (np.float32([p.pt for p in kr]), dr)
+    active = sorted(ref_feat)
+    raws = {k: np.full((n, 2), np.nan, np.float32) for k in active}
+    for k in active:
+        raws[k][refs[k]] = 0
+
+    def match_one(g, k, i):
+        w_, v_ = window(g, k, i)
+        sift = cv2.SIFT_create(1500)
+        k2, d2 = sift.detectAndCompute(w_, v_)
+        if d2 is None or len(k2) < 10:
+            return
+        src_all, dr = ref_feat[k]
+        pairs = cv2.BFMatcher().knnMatch(dr, d2, k=2)
+        good = [m[0] for m in pairs if len(m) == 2 and m[0].distance < 0.75 * m[1].distance]
+        if len(good) < 10:
+            return
+        src = src_all[[m.queryIdx for m in good]]
+        dst = np.float32([k2[m.trainIdx].pt for m in good])
+        A, inl = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=4)
+        if A is None or inl.sum() < 12 or inl.mean() < 0.25:
+            return
+        shift = A @ np.array([r, r, 1.0]) - r
+        if np.hypot(*shift) < 0.15 * min(H, W):
+            raws[k][i] = shift
+
+    # pass 2: stream the video; every `step`-th frame, match all holds in parallel
+    n_read = 0
+    if active:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        with ThreadPoolExecutor(max_workers=min(len(active), os.cpu_count() or 1)) as pool:
+            for i in range(n):
+                if i % step:
+                    if not cap.grab():
+                        break
+                    n_read = i + 1
+                    continue
+                ok, f = cap.read()
+                if not ok:
+                    break
+                n_read = i + 1
+                todo = [k for k in active if i != refs[k] and in_view(k, i)]
+                if todo:
+                    g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+                    list(pool.map(lambda k: match_one(g, k, i), todo))
+    cap.release()
+    if not active:
+        n_read = n
+    n = min(n, n_read) if active else n
+    out = np.zeros((n, len(items), 2), np.float32)
+    for done, k in enumerate(range(len(items)), 1):
+        if k in raws:
+            raw = raws[k][:n]
+            idx = np.where(~np.isnan(raw[:, 0]))[0]
+            if len(idx) >= 2:
+                for d in range(2):
+                    col = np.interp(np.arange(n), idx, raw[idx, d])
+                    med = np.array([np.median(col[max(0, t - 4):t + 5]) for t in range(n)])
+                    out[:, k, d] = [np.mean(med[max(0, t - 2):t + 3]) for t in range(n)]
         if progress:
-            progress(k + 1, len(items))
+            progress(done, len(items))
     return out
