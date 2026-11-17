@@ -277,3 +277,12 @@ code { font: 12px var(--mono); background: var(--wall); border-radius: 4px; padd
   .stat .v { font-size: 20px; }
   .stat .k { font-size: 12px; }
 }
+
+/* ---------- comparison with a second climb */
+.compare-panel { display: flex; flex-direction: column; gap: 10px; margin-top: 18px; }
+.compare-pick { display: flex; gap: 10px; flex-wrap: wrap; }
+#compare-results { display: flex; flex-direction: column; gap: 10px; }
+.compare-list li { grid-template-columns: 1fr; cursor: default; }
+.compare-list li.same { color: var(--muted); }
+.compare-list li[data-t] { cursor: pointer; }
+#compare-moves td.slow { font-weight: 700; color: var(--you); }

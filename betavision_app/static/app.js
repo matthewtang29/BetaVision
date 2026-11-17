@@ -755,7 +755,105 @@ function showResults(r) {
     ? "<tr><th>Joint</th><th>Most bent</th><th>Typical</th><th>Straightest</th></tr>" +
       r.angles.map((a) => `<tr><td>${a.joint}</td><td>${a.min}°</td><td>${a.median}°</td><td>${a.max}°</td></tr>`).join("")
     : "<tr><td>The climber wasn't tracked in any frame.</td></tr>";
+  resetCompare();
   show("step-results");
+}
+
+// ------------------------------------------------------------------ 5. compare with a second climb
+let compareTimer = null;
+
+function resetCompare() {
+  clearInterval(compareTimer);
+  $("compare-file").value = "";
+  $("compare-pick").hidden = false;
+  $("compare-progress").hidden = true;
+  $("compare-error").hidden = true;
+  $("compare-results").hidden = true;
+  $("compare-meta").textContent = "";
+  $("compare-player").removeAttribute("src");
+}
+
+function compareProgress(label, frac, busy) {
+  $("compare-progress").hidden = false;
+  $("compare-stage").textContent = label;
+  $("compare-pct").textContent = busy ? "" : `${Math.round(100 * frac)}%`;
+  $("compare-bar").style.width = `${Math.round(100 * frac)}%`;
+  $("compare-bar").parentElement.classList.toggle("busy", !!busy);
+}
+
+function compareFailed(msg) {
+  clearInterval(compareTimer);
+  $("compare-progress").hidden = true;
+  $("compare-pick").hidden = false;
+  $("compare-error").textContent = msg;
+  $("compare-error").hidden = false;
+}
+
+$("compare-file").addEventListener("change", () => {
+  const f = $("compare-file").files[0];
+  if (!f || !jobId) return;
+  $("compare-error").hidden = true;
+  $("compare-results").hidden = true;
+  $("compare-pick").hidden = true;
+  const fd = new FormData();
+  fd.append("file", f);
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", `/api/jobs/${jobId}/compare`);
+  xhr.upload.onprogress = (e) => { if (e.lengthComputable) compareProgress("Uploading…", e.loaded / e.total); };
+  xhr.onload = () => {
+    let body = {};
+    try { body = JSON.parse(xhr.responseText); } catch (e) { /* not JSON */ }
+    if (xhr.status !== 200) return compareFailed(body.detail || `Upload failed (${xhr.status}).`);
+    pollCompare();
+  };
+  xhr.onerror = () => compareFailed("Upload failed. Is BetaVision still running?");
+  compareProgress("Uploading…", 0);
+  xhr.send(fd);
+  $("compare-file").value = "";
+});
+
+function pollCompare() {
+  clearInterval(compareTimer);
+  const id = jobId;
+  compareTimer = setInterval(async () => {
+    if (id !== jobId) return clearInterval(compareTimer);
+    let s;
+    try { s = await (await fetch(`/api/jobs/${id}`)).json(); } catch (e) { return; }
+    const c = s.compare;
+    if (!c) return;
+    if (c.state === "error") return compareFailed(c.message);
+    if (c.state === "done") {
+      clearInterval(compareTimer);
+      $("compare-progress").hidden = true;
+      $("compare-pick").hidden = false;
+      return showCompare(c.results);
+    }
+    compareProgress(c.message || "Working…", c.progress || 0, c.state === "queued" || c.stage === "encode");
+  }, 1000);
+}
+
+function showCompare(r) {
+  const player = $("compare-player");
+  player.src = r.video_url;
+  $("compare-check").href = r.check_url;
+  $("compare-meta").textContent = `${r.a.video} vs ${r.b.video}`;
+  $("compare-stats").innerHTML =
+    stat(fmt(r.a.climb_s), `A on the route (${esc(r.a.video)})`) +
+    stat(fmt(r.b.climb_s), `B on the route (${esc(r.b.video)})`) +
+    stat(`${r.registration.inliers}`, `Wall features matched over ${r.registration.frame_pairs_agreeing} frame pairs`);
+  $("compare-seqs").innerHTML = r.sequences.map((q) => q.same
+    ? `<li class="same"><span>${esc(q.limb)}: same holds (${q.a.length})</span></li>`
+    : `<li><span><b>${esc(q.limb)}</b>: ${q.differences.map(esc).join("; ")}</span></li>`).join("");
+  $("compare-posture").innerHTML = r.posture.length ? r.posture.map((p, i) =>
+    `<li data-t="${p.video_t}"><span class="what"><span>${esc(p.summary)}</span>` +
+    `<span class="t">A ${fmt(p.a_from)}–${fmt(p.a_to)} · B ${fmt(p.b_from)}–${fmt(p.b_to)} · ${p.mean_angle_diff_deg}° apart on average</span></span></li>`).join("")
+    : `<li class="empty">Nowhere more than 25° apart on average.</li>`;
+  $("compare-posture").querySelectorAll("li[data-t]").forEach((li) =>
+    li.addEventListener("click", () => { player.currentTime = +li.dataset.t; player.play(); }));
+  $("compare-moves").innerHTML = "<tr><th>Move</th><th>A</th><th>B</th><th>B − A</th></tr>" +
+    r.moves.map((m) => `<tr><td>${esc(m.move)}</td><td>${m.a_s.toFixed(1)} s</td><td>${m.b_s.toFixed(1)} s</td>` +
+      `<td class="${m.slow ? "slow" : ""}">${m.diff_s >= 0 ? "+" : ""}${m.diff_s.toFixed(1)} s</td></tr>`).join("");
+  $("compare-results").hidden = false;
 }
 
 // ------------------------------------------------------------------ start over
@@ -765,6 +863,7 @@ function restart() {
   clearTimeout(refreshTimer); dirty = false; setPending(false);
   $("player").removeAttribute("src");
   $("player").load();
+  resetCompare();
   job = null; P = null; holds = []; vols = []; offs = []; jobId = null;
   fileInput.value = "";
   drop.hidden = false;

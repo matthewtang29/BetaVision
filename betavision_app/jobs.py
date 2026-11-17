@@ -14,6 +14,7 @@ One Job per uploaded video:
 Nothing here opens an OpenCV window.
 """
 
+import json
 import math
 import os
 import queue
@@ -36,6 +37,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))      # climb_*.py live in the repo root
 import climb_analyze as ca         # noqa: E402
+import climb_compare as ccmp       # noqa: E402
 import climb_holds as ch           # noqa: E402
 import climb_motion as cm          # noqa: E402
 import climb_notes as cn           # noqa: E402
@@ -51,6 +53,8 @@ ANGLE_NAMES = {"elbow": "Elbows", "knee": "Knees", "hip": "Hips"}
 CACHE_BYTES = int(float(os.environ.get("BETAVISION_CACHE_MB", 1536)) * 1024 * 1024)   # per job: frames, colour data, outlines
 MAX_KEPT_JOBS = 4         # jobs that aren't busy (picking / done / failed) kept in memory; the least recently used are freed
 BUSY = ("uploading", "preparing", "starting", "queued", "running")
+COMPARE_BUSY = ("queued", "running")
+COMPARE_LOCK = threading.Lock()    # one comparison at a time (each tracks a whole video)
 
 
 class PickerError(ValueError):
@@ -83,6 +87,10 @@ class Job:
         self.discard = False           # freed while busy: free it when it stops
         self.cam, self.moved, self.keyframes = None, 0.0, None   # keyframes: set when the camera moved a lot
         self.off_route, self.flag_off_route = [], True             # off-route wall holds (base pixels), flag touches?
+        self.pose = None               # after the analysis: (px, vis, wall) per frame, for a comparison
+        self.cam_used = None           # the camera homographies the analysis used (None = still camera)
+        self.compare = None            # comparison with a second climb: {state, message, progress, results}
+        self.compare_files = {}        # its outputs: video (H.264), check (registration JPEG)
 
     # ---------------------------------------------------------------- open + follow the camera
     def open(self, still):
@@ -414,10 +422,13 @@ class Job:
             if reader is not None:
                 reader.cap.release()
 
+    def busy(self):
+        return self.state in BUSY or (self.compare or {}).get("state") in COMPARE_BUSY
+
     def free(self):
         """Release everything and delete this job's files. A job that is still working is
         marked and freed when it stops."""
-        if self.state in BUSY:
+        if self.busy():
             self.discard = True
             return False
         self.release()
@@ -427,7 +438,7 @@ class Job:
     # ---------------------------------------------------------------- status
     def status(self):
         return {"id": self.id, "state": self.state, "stage": self.stage, "message": self.message,
-                "progress": round(self.progress, 3), "results": self.results,
+                "progress": round(self.progress, 3), "results": self.results, "compare": self.compare,
                 "info": self.info() if self.state == "picking" else None}
 
 
@@ -707,6 +718,84 @@ def parse_notes(text):
     return lines
 
 
+# ---------------------------------------------------------------- comparing with a second climb
+COMPARE_STAGES = {"camera": "Following the camera", "pose": "Tracking the climber",
+                  "draw": "Drawing the side-by-side video"}
+
+
+def start_compare(job, video_b):
+    """Compare the analysed climb (A) with a second video of the same route (B) in a background
+    thread. The route is the one marked for A; B's wall is registered onto A's."""
+    if job.state != "done":
+        raise JobBusy("Analyze this climb first, then compare.")
+    if (job.compare or {}).get("state") in COMPARE_BUSY:
+        raise JobBusy("A comparison for this climb is already running.")
+    job.compare = {"state": "queued", "stage": "", "message": "Waiting for the previous comparison", "progress": 0.0,
+                   "results": None}
+    threading.Thread(target=_run_compare, args=(job, Path(video_b)), daemon=True).start()
+
+
+def _run_compare(job, video_b):
+    st = job.compare
+    try:
+        with COMPARE_LOCK:
+            if job.discard:
+                return
+            st["state"], st["message"] = "running", "Starting"
+
+            def progress(stage, done, total):
+                st["stage"], st["message"] = stage, COMPARE_STAGES.get(stage, stage)
+                st["progress"] = done / total if total else 0.0
+
+            route_file = job.dir / f"{job.name}_holds.json"
+            route = json.loads(route_file.read_text()) if route_file.exists() else {"frame": job.base, "holds": []}
+            out = job.dir / "compare"
+            data, cam = job.pose, job.cam_used
+            if cam is None:              # the analysis didn't warp (still camera, or no holds marked)
+                px, vis, _ = job.pose
+                if job.cam is not None:  # but the camera was followed: wall coordinates from that
+                    data, cam = (px, vis, None), job.cam
+                else:
+                    cam = [np.eye(3)] * len(px)
+            s = ccmp.compare(job.input, video_b, route, out, job.model, data_a=data, cam_a=cam,
+                             log=lambda m: print(f"[{job.id} compare] {m}"), progress=progress)
+            st["stage"], st["message"], st["progress"] = "encode", "Encoding the video for your browser", 1.0
+            video = out / f"{job.name}_vs_{video_b.stem}_compare_h264.mp4"
+            to_h264(s["outputs"]["video"], video)
+            job.compare_files = {"video": video, "check": Path(s["outputs"]["registration_image"])}
+            st["results"] = summarize_compare(job, s)
+            st["state"], st["message"] = "done", ""
+    except ccmp.RegistrationError as e:
+        st["state"], st["message"] = "error", f"Couldn't match the second video's wall to this one: {e}"
+    except Exception as e:
+        traceback.print_exc()
+        st["state"], st["message"] = "error", f"Comparison failed: {e}"
+    finally:
+        if st["state"] in COMPARE_BUSY:
+            st["state"] = "error"
+        if job.discard and not job.busy():
+            job.discard = False
+            job.free()
+
+
+def summarize_compare(job, s):
+    """climb_compare's summary -> what the comparison panel shows."""
+    seqs = [{"limb": LIMB_NAMES[q["limb"]], "same": q["same"], "a": [str(h) for h in q["a"]],
+             "b": [str(h) for h in q["b"]], "differences": q["differences"]} for q in s["hold_sequences"]]
+    moves = [dict(m, slow=bool(abs(m["diff_s"]) >= max(0.5, 0.4 * m["a_s"]))) for m in s["moves"]]
+    # the comparison video plays one alignment step per frame: where A's time t shows up in it
+    fps_a = s["a"]["fps"]
+    steps_a = [i for i, _ in s["path"]]
+
+    def video_t(t):
+        k = next((k for k, i in enumerate(steps_a) if i >= t * fps_a), len(steps_a) - 1)
+        return round(k / fps_a, 2)
+    posture = [dict(p, video_t=video_t(p["a_from"])) for p in s["posture_sections"]]
+    return {"a": s["a"], "b": s["b"], "registration": {k: v for k, v in s["registration"].items() if k != "b_to_a"},
+            "sequences": seqs, "moves": moves, "posture": posture,
+            "video_url": f"/api/jobs/{job.id}/compare/video", "check_url": f"/api/jobs/{job.id}/compare/check"}
+
+
 # ---------------------------------------------------------------- the background worker
 STAGES = {"lock": "Locking each hold onto the wall", "track": "Tracking the climber",
           "draw": "Drawing the video"}
@@ -745,7 +834,7 @@ class Worker:
     def trim(self):
         """Keep only the MAX_KEPT_JOBS most recently used jobs that aren't busy; free the rest."""
         with self.lock:
-            idle = sorted((j for j in self.jobs.values() if j.state not in BUSY and not j.discard),
+            idle = sorted((j for j in self.jobs.values() if not j.busy() and not j.discard),
                           key=lambda j: j.touched, reverse=True)
             drop = idle[MAX_KEPT_JOBS:]
             for j in drop:
@@ -819,6 +908,7 @@ class Worker:
         job.output = job.dir / f"{job.name}_analysis_h264.mp4"
         to_h264(res["out_video"], job.output)
         job.csv = res["out_csv"]
+        job.pose, job.cam_used = (res["px"], res["vis"], res["wall"]), cam
         job.results = summarize(job, res, job.holds, job.vols)
         job.state, job.message = "done", ""
         print(f"[{job.id}] done: {job.output}")

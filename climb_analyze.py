@@ -252,6 +252,8 @@ def analyze_video(video, holds, vols, cam, model="full", out_dir=None, save_data
     notes, per frame `limb_holds` ({limb: hold id / volume id / ""}) and `angles`, and
     `off_route` (possible off-route touches: [{limb, hold, start, end (frames, end exclusive),
     t, dur (s)}]), `off_route_holds` (the holds checked, base pixels) and `off_route_enabled`.
+    Per frame, as arrays over cp.JOINTS (NaN / 0 when the climber wasn't found): `px` (n, 16, 2)
+    frame pixels, `wall` (n, 16, 2) base-frame pixels, `vis` (n, 16) (climb_compare uses them).
     """
     video = Path(video)
     out_dir = Path(out_dir) if out_dir else video.parent
@@ -288,6 +290,10 @@ def analyze_video(video, holds, vols, cam, model="full", out_dir=None, save_data
         header += [f"{name}_x", f"{name}_y", f"{name}_z", f"{name}_vis"]
     header += ["hip_center_x", "hip_center_y", *cp.ANGLES]
     header += [f"{limb}_hold" for limb in LIMBS]
+    # wall coordinates (BASE-frame pixels, the frame of *_holds.json): written after
+    # off_route_touch so every older column keeps its place. climb_compare reads them.
+    wall_header = [f"{name}_{c}" for name in cp.JOINTS.values() for c in ("wx", "wy")]
+    wall_header += ["hip_center_wx", "hip_center_wy"]
 
     notes = cn.load_notes(note_args, notes_file)
     # off-route holds (wall + volume cut-outs), base pixels: a limb inside one is checked for a touch
@@ -301,6 +307,8 @@ def analyze_video(video, holds, vols, cam, model="full", out_dir=None, save_data
     hold_needed = max(3, int(round(0.2 * fps)))   # both hands on the END hold for ~0.2 s = topped
     records = []                                  # per frame: pose + which hold each limb is on
     angles = []                                   # per frame: joint angles (for the web app)
+    wall_rows = []                                # per frame: joints in base-frame pixels (CSV)
+    wall_pts = []                                 # the same as (16, 2) arrays, NaN when not tracked
 
     def frame_layout(fi):
         """Where the marked holds/volumes are in frame fi (they follow the camera)."""
@@ -376,6 +384,13 @@ def analyze_video(video, holds, vols, cam, model="full", out_dir=None, save_data
                 for limb, idx in LIMBS.items():
                     if on_hold[limb] != "":
                         base_pts[limb] = tuple(cm.warp_points([pts[idx]], to_base)[0])
+                wj = cm.warp_points([pts[idx] for idx in cp.JOINTS], to_base).astype(float)
+                wall_pts.append(wj)
+                hipw = (wj[list(cp.JOINTS).index(23)] + wj[list(cp.JOINTS).index(24)]) / 2
+                wall_rows.append([round(float(v), 1) for v in wj.ravel()] + [round(float(v), 1) for v in hipw])
+            else:
+                wall_pts.append(np.full((len(cp.JOINTS), 2), np.nan))
+                wall_rows.append([""] * len(wall_header))
             for limb, idx in LIMBS.items():           # off-route: only a visible limb on no route hold / volume
                 hit, bp = "", None
                 if off_cnts and pts is not None and vis[idx] >= cp.MIN_VIS and on_hold[limb] == "":
@@ -401,9 +416,9 @@ def analyze_video(video, holds, vols, cam, model="full", out_dir=None, save_data
         log(f"Possible off-route touches: {len(off_events)} (checked {len(off_holds)} off-route holds)")
     with open(out_csv if save_data else os.devnull, "w", newline="") as f:
         rows = csv.writer(f)
-        rows.writerow(header + ["off_route_touch"])     # new column last: every older column keeps its place
-        for row, fl in zip(csv_rows, flags):
-            rows.writerow(row + [";".join(f"{limb}:{hid}" for hid, limbs in sorted(fl.items()) for limb in limbs)])
+        rows.writerow(header + ["off_route_touch"] + wall_header)   # new columns last: older ones keep their place
+        for row, fl, wr in zip(csv_rows, flags, wall_rows):
+            rows.writerow(row + [";".join(f"{limb}:{hid}" for hid, limbs in sorted(fl.items()) for limb in limbs)] + wr)
 
     # ---- notes: decide which hold each one points at
     if notes:
@@ -471,7 +486,11 @@ def analyze_video(video, holds, vols, cam, model="full", out_dir=None, save_data
             "frames": frame_i, "detected": detected, "has_end": has_end,
             "topped_s": topped_frame / fps if topped_frame is not None else None,
             "limb_holds": [r["on_hold"] for r in records], "angles": angles, "notes": notes,
-            "off_route": off_events, "off_route_holds": off_holds, "off_route_enabled": bool(flag_off_route)}
+            "off_route": off_events, "off_route_holds": off_holds, "off_route_enabled": bool(flag_off_route),
+            "wall": np.array(wall_pts).reshape(-1, len(cp.JOINTS), 2),
+            "vis": np.array([[r["vis"][i] if r["vis"] else 0.0 for i in cp.JOINTS] for r in records]).reshape(-1, len(cp.JOINTS)),
+            "px": np.array([[r["pts"][i] if r["pts"] else (np.nan, np.nan) for i in cp.JOINTS]
+                            for r in records], float).reshape(-1, len(cp.JOINTS), 2)}
 
 
 def main():

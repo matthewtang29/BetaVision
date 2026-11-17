@@ -229,3 +229,30 @@ def test_busy_job_is_freed_when_it_stops(jobs_mod, open_job):
     assert w.remove(job.id) and job.dir.exists() and job.discard      # can't pull files from under a running analysis
     job.state = "done"
     assert job.free() and not job.dir.exists()
+
+
+def test_compare_needs_a_finished_analysis_and_a_video(client, video):
+    c, server = client
+    jid = upload(c, video)
+    r = c.post(f"/api/jobs/{jid}/compare", files={"file": ("b.avi", video.read_bytes())})
+    assert r.status_code == 409 and "Analyze" in r.json()["detail"]
+    server.worker.jobs[jid].state = "done"
+    server.worker.jobs[jid].holds = []
+    r = c.post(f"/api/jobs/{jid}/compare", files={"file": ("b.avi", video.read_bytes())})
+    assert r.status_code == 409 and "route" in r.json()["detail"]
+    server.worker.jobs[jid].holds = [{"id": 1, "contour": [[0, 0], [9, 0], [9, 9]]}]
+    r = c.post(f"/api/jobs/{jid}/compare", files={"file": ("b.txt", b"hello")})
+    assert r.status_code == 400
+    r = c.post(f"/api/jobs/{jid}/compare", files={"file": ("b.mp4", b"not a video")})
+    assert r.status_code == 400 and "read" in r.json()["detail"]
+    assert c.get(f"/api/jobs/{jid}/compare/video").status_code == 409
+
+
+def test_running_comparison_keeps_the_job(jobs_mod, open_job):
+    w = jobs_mod.Worker()
+    job = open_job(w)
+    job.state = "done"
+    job.compare = {"state": "running"}
+    assert job.busy() and w.remove(job.id) and job.dir.exists() and job.discard
+    job.compare["state"] = "done"
+    assert job.free() and not job.dir.exists()

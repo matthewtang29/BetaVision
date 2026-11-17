@@ -38,7 +38,8 @@ Built with Python, OpenCV and MediaPipe Pose.
 - **Sticky-note annotations.** Add notes like `20-21 footswap`; each appears as a sticky note pinned to a hold for that time window and follows the hold if the camera moves. Without a hold number it pins itself to the hold in use then (feet for foot moves, hands for hand moves).
 - **Top-out detection.** When both hands match on the end hold, a *CONGRATULATIONS!* banner appears with the time, and the hold overlays clear away.
 - **Interactive picker UI.** Scrub through the video, zoom (up to 4x) and scroll to mark small holds precisely, undo any action, with an on-screen instructions panel.
-- **Clean output.** Saves a single annotated video by default. Optional per-frame CSV (joint positions, elbow/knee/hip angles, which hold each limb is on, and an `off_route_touch` column such as `l_foot:X3` while a possible off-route touch lasts) with `--save-data`.
+- **Clean output.** Saves a single annotated video by default. Optional per-frame CSV (joint positions, elbow/knee/hip angles, which hold each limb is on, an `off_route_touch` column such as `l_foot:X3` while a possible off-route touch lasts, and each joint in wall coordinates, `<joint>_wx` / `<joint>_wy`, the pixels of the frame the route was marked in) with `--save-data`. New columns are always added at the end.
+- **Compare two climbs of the same route** (first version, see [Comparing two climbs](#comparing-two-climbs)). The second video can be filmed from elsewhere: its wall is matched to the first video's, the two climbs are lined up move by move with dynamic time warping, and you get a side-by-side video plus where the hold sequences, the time per move and the posture differ.
 
 ## How it works
 
@@ -67,6 +68,7 @@ video ──► camera tracking (optical flow + ORB re-anchoring) ─► homogra
 | `climb_offroute.py` | Off-route holds on the wall and the rules for flagging a touch of one. |
 | `climb_motion.py` | Camera tracking and whole-wall panorama stitching. |
 | `climb_notes.py` | Sticky-note annotations. |
+| `climb_compare.py` | Compares two climbs of the same route: wall registration, size-independent features, dynamic time warping, side-by-side video and summary. |
 | `climb_pose.py` | Pose tracking only: skeleton video + per-frame CSV (usable on its own). |
 | `betavision_app/` | Local web app: a small FastAPI server plus one web page, wrapping the same analysis code. |
 | `run_betavision.bat` | Windows launcher for the web app (double-click). |
@@ -149,6 +151,26 @@ python climb_analyze.py my_climb.mov --no-off-route         # don't flag touches
 
 Saved `*_holds.json` files now also hold the off-route wall holds (`"off_route"`), so `--holds` reuses them. Files saved before this have none; they still load, and only the off-route cut-outs on volumes are checked.
 
+### Comparing two climbs
+
+Two videos of the same route (two climbers, or two of your attempts), and the route marked once on the first one:
+
+```bash
+python climb_analyze.py a.mov --save-data                     # mark the route on video A: a_holds.json
+python climb_compare.py a.mov b.mov --holds a_holds.json      # compare B with A
+python climb_compare.py a.mov b.mov --holds a_holds.json --data-a a_analysis.csv   # reuse A's pose
+```
+
+- **Video B can be filmed from anywhere** that shows the same wall. Wall features (the climbers masked out) are matched between a spread of frames of both videos and fitted with one homography, so the route doesn't have to be marked twice. If the wall can't be matched reliably (too few agreeing features, or matches that disagree with each other) it stops and says so instead of drawing the route in the wrong place.
+- **Size doesn't matter.** Each frame is described by the hip centre's position on the route (as a fraction of the route's height), each hand and foot relative to the hips in torso lengths, the elbow/knee/hip angles measured on the wall, and which hold each limb is on.
+- **Pacing doesn't matter.** Dynamic time warping lines the two climbs up so a slow and a fast climber are compared at the same point of the route. Walking up to the wall and stepping off are trimmed first (from a little before a hand first reaches a route hold to a little after the last one).
+- **Outputs** (next to video A, or `--out`): `a_vs_b_compare.mp4`, both climbs side by side and in step, with B's skeleton drawn as a green ghost on A's wall; `a_vs_b_compare.json` and a printed summary: the hold sequence of each hand and foot and where they differ, the time each of A's moves took and how long B took over the same stretch, and the sections where the posture differs most (25° or more averaged over the six joint angles); `a_vs_b_registration.jpg`, the route drawn on video B. **Look at that picture first**: if the outlines aren't on the right holds, nothing else is trustworthy.
+- Pose and camera tracking are cached in the output folder (`*_track_<model>.npz`, `*_cam_<frame>.npz`), so comparing the same videos again is quick.
+
+In the web app, a finished analysis (with the route marked) has a *Compare with another climb* panel: choose the second video and you get the side-by-side video, the registration check picture and the same summary.
+
+**State of this feature.** Tested on real footage only partly: there is no pair of videos of the *same route* in the test set yet. What was checked: the wall registration between two different real camera positions on the same wall (two clips of different routes, which line up to within a couple of pixels where the wall overlaps), and the whole comparison on one real climb against a copy of itself that was trimmed, played at a varying speed (0.3x to 1.5x) and seen through a different (synthetic) camera position: the alignment found the right frame to a median of 1 frame (90% within 5 frames, worst 11), the registration was within 2.5 px (median) of the true one, and the time per move matched the known timing except one move boundary during a rest. Comparing the same climber filmed two ways also showed how noisy the pose is between views: joint angles differ by up to ~20°, which is why posture sections start at 25°; one false section remained, at the drop-off after the top, where the alignment lags by ~0.25 s during fast movement. Two genuinely different climbers on one route are still to be tried.
+
 ## Web app (Windows)
 
 Prefer clicking to typing commands? BetaVision also runs as a local web app. It uses exactly the same analysis code, and everything stays on your computer: no cloud, no account.
@@ -221,7 +243,7 @@ These are results on synthetic walls; real gym footage will vary. Off-route touc
 
 ## Roadmap
 
-- [ ] Compare two climbers on the same route (normalized joints + dynamic time warping)
+- [ ] Compare two climbers on the same route (normalized joints + dynamic time warping). First version in `climb_compare.py` and the web app; not yet tried on two climbs of the same route (see [Comparing two climbs](#comparing-two-climbs))
 - [x] Volume detection, with off-route holds on volumes excluded
 - [x] Flag off-route hold touches in the video
 - [x] Camera-motion compensation (feature tracking / homography) and whole-wall panorama

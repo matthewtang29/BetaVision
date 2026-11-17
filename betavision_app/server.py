@@ -11,12 +11,17 @@ and a small JSON API:
   GET  /api/jobs/{id}/video           annotated H.264 video (inline)
   GET  /api/jobs/{id}/download        the same video as a download
   GET  /api/jobs/{id}/csv             per-frame data
+  POST /api/jobs/{id}/compare         upload a second climb of the route and compare it (background)
+  GET  /api/jobs/{id}/compare/video   the side-by-side comparison video (H.264)
+  GET  /api/jobs/{id}/compare/check   the route drawn on the second video (registration check)
 """
 
+import re
 import shutil
 from pathlib import Path
 from typing import Any
 
+import cv2
 from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -137,6 +142,54 @@ def download(job_id: str):
 def csv(job_id: str):
     job, path = output(job_id, "csv")
     return FileResponse(path, media_type="text/csv", filename=f"{job.name}_analysis.csv")
+
+
+@app.post("/api/jobs/{job_id}/compare")
+def compare(job_id: str, file: UploadFile = File(...)):
+    job = get_job(job_id)
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in jobs.VIDEO_TYPES:
+        raise HTTPException(400, "Please choose an .mp4, .mov or .avi video.")
+    if job.state != "done":
+        raise HTTPException(409, "Analyze this climb first, then compare.")
+    if (job.compare or {}).get("state") in jobs.COMPARE_BUSY:
+        raise HTTPException(409, "A comparison for this climb is already running.")
+    if not getattr(job, "holds", None):
+        raise HTTPException(409, "Mark the route's holds first (start over and don't skip them): the comparison "
+                                 "uses the route to find where each climb starts and ends and which hold each "
+                                 "hand and foot is on.")
+    stem = re.sub(r"[^\w\-]+", "_", Path(file.filename).stem).strip("_") or "climb_b"
+    if stem == job.name:
+        stem += "_b"
+    dest = job.dir / "compare" / f"{stem}{suffix}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest, "wb") as out:
+        shutil.copyfileobj(file.file, out, 1024 * 1024)
+    cap = cv2.VideoCapture(str(dest))
+    ok = cap.isOpened() and cap.read()[0]
+    cap.release()
+    if not ok:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(400, "Couldn't read that video. Try exporting it again as .mp4.")
+    jobs.start_compare(job, dest)
+    return job.status()
+
+
+def compare_output(job_id, key):
+    job = get_job(job_id)
+    if (job.compare or {}).get("state") != "done" or key not in job.compare_files:
+        raise HTTPException(409, "The comparison isn't finished yet.")
+    return job.compare_files[key]
+
+
+@app.get("/api/jobs/{job_id}/compare/video")
+def compare_video(job_id: str):
+    return FileResponse(compare_output(job_id, "video"), media_type="video/mp4")
+
+
+@app.get("/api/jobs/{job_id}/compare/check")
+def compare_check(job_id: str):
+    return FileResponse(compare_output(job_id, "check"), media_type="image/jpeg")
 
 
 app.mount("/", StaticFiles(directory=STATIC, html=True), name="static")

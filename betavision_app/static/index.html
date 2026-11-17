@@ -229,6 +229,30 @@
           <p class="hint small">Across all frames where the climber was tracked.</p>
           <table id="angles" class="angles"></table>
         </div>
+        <div class="panel compare-panel" id="compare-panel">
+          <div class="section-head"><h2>Compare with another climb</h2><span id="compare-meta" class="mono meta"></span></div>
+          <p class="hint small">Another video of the same route: a friend's attempt, or your next one. It can be filmed from somewhere else; BetaVision matches its wall to this one and uses the route you marked here (so the route has to be marked). The two climbs are lined up move by move, so a faster and a slower climber are compared at the same point of the route.</p>
+          <div id="compare-pick" class="compare-pick">
+            <label class="btn outline" for="compare-file">Choose second video</label>
+            <input id="compare-file" type="file" accept=".mp4,.mov,.avi,video/*" hidden>
+          </div>
+          <div id="compare-progress" class="progress-block" hidden>
+            <div class="progress-label"><span id="compare-stage">Uploading…</span><span id="compare-pct">0%</span></div>
+            <div class="bar"><div id="compare-bar"></div></div>
+          </div>
+          <p id="compare-error" class="error" hidden></p>
+          <div id="compare-results" hidden>
+            <div class="player"><video id="compare-player" controls playsinline preload="metadata"></video></div>
+            <p class="hint small">Left: this climb (A), with the second climber as a green ghost on this wall. Right: the second video (B). <a id="compare-check" target="_blank" rel="noopener">Check the wall match</a> (the route drawn on the second video) before trusting the rest.</p>
+            <div class="stats" id="compare-stats"></div>
+            <div class="section-head"><h2>Hold sequences</h2></div>
+            <ul id="compare-seqs" class="moves compare-list"></ul>
+            <div class="section-head"><h2>Where the posture differs most</h2><span class="mono meta">click to jump there</span></div>
+            <ul id="compare-posture" class="moves compare-list"></ul>
+            <div class="section-head"><h2>Time per move</h2><span class="mono meta">A's moves, B over the same stretch</span></div>
+            <table id="compare-moves" class="angles"></table>
+          </div>
+        </div>
       </div>
 
       <aside class="results-side">
