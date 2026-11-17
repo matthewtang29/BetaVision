@@ -104,7 +104,7 @@
             <button class="round-btn small" id="zoom-fit" title="Fit (0)">⤢</button>
           </div>
         </div>
-        <p class="hint small">Right-click a wrong hold or volume to remove it. Scroll to zoom, drag to move.</p>
+        <p class="hint small">Right-click a wrong hold or volume to remove it, or an orange-red off-route outline that isn't a hold. Scroll to zoom, drag to move.</p>
         <div class="field keyframes" id="keyframes" hidden>
           <span class="field-label">Frames <span class="muted"><kbd>[</kbd> <kbd>]</kbd> previous / next</span></span>
           <div class="strip" id="strip"></div>
@@ -131,6 +131,7 @@
               <option value="heavy">Heavy · most accurate, slow</option>
             </select>
             <label class="check" id="lock-row" hidden><input type="checkbox" id="lock" checked><span>Lock each hold onto the wall <span class="muted">(slower, steadier outlines)</span></span></label>
+            <label class="check" id="offroute-row"><input type="checkbox" id="offroute" checked><span>Flag possible off-route touches <span class="muted">(a hand or foot resting on a hold of another colour)</span></span></label>
           </div>
         </div>
       </div>
@@ -187,6 +188,7 @@
             <li><i class="sw end"></i>end</li>
             <li><i class="sw vol"></i>volume</li>
             <li><i class="sw cut"></i>off-route on a volume</li>
+            <li><i class="sw off"></i>off-route on the wall</li>
           </ul>
         </div>
 
@@ -233,6 +235,11 @@
         <div class="section-head"><h2>Hold sequence</h2><span id="moves-count" class="mono meta"></span></div>
         <p class="hint small">Each hand or foot that stayed on a hold for at least 0.2 s. Click a row to jump there.</p>
         <ol id="moves" class="moves"></ol>
+        <div id="offroute-block" hidden>
+          <div class="section-head"><h2>Possible off-route touches</h2><span id="offroute-count" class="mono meta"></span></div>
+          <p class="hint small">A hand or foot that rested on a hold that isn't on the route for about 0.6 s or more. Check the video: pose tracking is 2D, so a limb in front of a hold can look like it's on it. Click a row to jump there.</p>
+          <ul id="offroute-list" class="moves offroute-list"></ul>
+        </div>
         <div id="notes-block" hidden>
           <div class="section-head"><h2>Sticky notes</h2></div>
           <ul id="notes-list" class="moves notes-list"></ul>

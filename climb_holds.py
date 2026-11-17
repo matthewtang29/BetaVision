@@ -9,6 +9,8 @@ How it works:
                      Click a missed hold (shadowed, chalky) to widen the match.
        MANUAL mode : each click outlines just the hold you clicked.
      In both modes, RIGHT-click a hold (or volume) to delete it.
+     Holds of OTHER colours on the wall are outlined thin orange-red: they're off-route,
+     and a hand or foot resting on one is flagged in the video. Right-click a wrong one.
      VOLUMES are found automatically. Grey ones always count as allowed; a painted
      volume only counts if it's the route's colour (add one by hand with V/P to force it);
      holds on a volume that aren't the route's colour are cut out of it.
@@ -28,7 +30,8 @@ Window controls (also listed in the window itself):
     mouse wheel  scroll up/down     shift+wheel  left/right
     ctrl+wheel or + / -  zoom       arrow keys   move      0  zoom to fit
     left click   AUTO: find all holds of this colour | MANUAL: add this one hold
-    right click  delete the hold under the cursor
+    right click  delete the hold under the cursor (or an off-route outline / cut-out
+                 that isn't a real off-route hold)
     m            switch AUTO / MANUAL
     s            next click tags a START hold (click a tagged one again to untag; max 2)
     e            next click tags the END hold
@@ -56,6 +59,7 @@ GROW = 1.7            # holds grow into connected pixels within GROW x the colou
 GRABCUT_SEED = 1
 GREEN, CYAN, MAGENTA, ORANGE, RED = (0, 255, 0), (255, 255, 0), (255, 0, 255), (0, 165, 255), (0, 0, 255)
 VOL_COLOR, CUT_COLOR = (235, 235, 235), (180, 105, 255)     # volumes white, off-route cut-outs pink
+OFF_COLOR = (0, 69, 255)                                     # off-route holds on the wall: orange-red
 ROLE_COLOR = {"start": CYAN, "end": RED}
 ROLE_LABEL = {"start": "START", "end": "END"}
 
@@ -874,6 +878,14 @@ def filter_coloured_volumes(lab, vols, holds):
     return kept, skipped
 
 
+def draw_off_route(out, off):
+    """Off-route holds on the wall (climb_offroute): thin orange-red outline."""
+    th = max(1, _fd(*out.shape[:2])[0] // 400)
+    for hd in off:
+        cv2.polylines(out, [np.array(hd["contour"], np.int32)], True, OFF_COLOR, th, cv2.LINE_AA)
+    return out
+
+
 def route_mask(holds, shape):
     m = np.zeros(shape[:2], np.uint8)
     for hd in holds:
@@ -946,14 +958,14 @@ def draw_panel(lines):
             y += 24
         elif style.startswith("swatch"):      # coloured line sample + label
             color = {"swatch_g": GREEN, "swatch_o": ORANGE, "swatch_c": CYAN, "swatch_r": RED,
-                     "swatch_w": VOL_COLOR, "swatch_p": CUT_COLOR}[style]
+                     "swatch_w": VOL_COLOR, "swatch_p": CUT_COLOR, "swatch_x": OFF_COLOR}[style]
             cv2.line(panel, (16, y - 5), (40, y - 5), color, 3, cv2.LINE_AA)
             cv2.putText(panel, txt, (50, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1, cv2.LINE_AA)
-            y += 20
+            y += 19
         else:
             color = (255, 255, 255) if style == "strong" else (200, 200, 200)
             cv2.putText(panel, txt, (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
-            y += 20
+            y += 19
     return panel
 
 
@@ -969,6 +981,7 @@ def interactive(reader, start_frame, fixed_img=None, frame_dims=None, fixed_labe
 
 
 def _interactive(reader, start_frame, fixed_img=None, fixed_label=None):
+    import climb_offroute as co                         # (it imports this module)
     img = fixed_img if fixed_img is not None else reader.read(start_frame)
     if img is None:
         sys.exit("Could not read the video")
@@ -980,6 +993,7 @@ def _interactive(reader, start_frame, fixed_img=None, fixed_label=None):
          "starts": [], "end": None, "tag": None, "msg": "", "poly": [],
          "vols_auto": cvol.detect_volumes(img), "vols_manual": [], "vols_deleted": [], "vols": [],
          "auto": [], "auto_key": None, "holds": [], "dirty": True, "annotated": None,
+         "off_cands": [], "off_key": None, "off": [], "off_deleted": [], "cuts_deleted": [],
          "zoom": fit, "ox": 0.0, "oy": 0.0}         # ox/oy = image pixel at the viewport's top-left
 
     # ---------- view (zoom + scroll)
@@ -1113,10 +1127,18 @@ def _interactive(reader, start_frame, fixed_img=None, fixed_label=None):
                     break
             else:
                 hits = [hd for hd in S["holds"] if inside(hd, (fx, fy))]
+                off_hit = next((hd for hd in S["off"] if inside(hd, (fx, fy))), None)
+                cut_hit = any(inside({"contour": e}, (fx, fy)) for v in S["vols"] for e in v.get("exclude", []))
                 if hits:                                # remember its OUTLINE, not just the point
                     hit = min(hits, key=lambda hd: hd["area"])
                     S["deleted"].append({"pt": [fx, fy], "contour": hit["contour"]})
                     S["history"].append("deleted")
+                elif off_hit is not None:               # not really an off-route hold
+                    S["off_deleted"].append(off_hit["contour"])
+                    S["history"].append("off_deleted")
+                elif cut_hit:                           # a cut-out on a volume that isn't a hold
+                    S["cuts_deleted"].append([fx, fy])
+                    S["history"].append("cut_deleted")
                 else:
                     for i, v in enumerate(S["vols_manual"]):
                         if cvol.inside_volume(v, (fx, fy)):
@@ -1148,6 +1170,10 @@ def _interactive(reader, start_frame, fixed_img=None, fixed_label=None):
             S["vols_manual"].pop()
         elif last == "vol_deleted":
             S["vols_deleted"].pop()
+        elif last == "off_deleted":
+            S["off_deleted"].pop()
+        elif last == "cut_deleted":
+            S["cuts_deleted"].pop()
         elif last[0] == "unmanual":
             S["manual"].append(last[1])
         elif last[0] == "unvol":
@@ -1176,18 +1202,16 @@ def _interactive(reader, start_frame, fixed_img=None, fixed_label=None):
                   else "1. This is your whole wall, stitched together"),
                  "2. Click one hold of your route",
                  "    -> every hold that colour is outlined",
-                 "3. Right-click wrong holds or volumes",
+                 "3. Right-click anything that's wrong",
                  "4. M = manual: click any missed holds",
-                 "5. S, click a start hold (twice)",
-                 "    E, click the end hold",
+                 "5. S + click start holds, E + the end hold",
                  "6. Volumes are found automatically",
                  "    (always allowed). Missed one? V + click,",
                  "    or P + click its corners (exact outline)",
                  ("7. Press ENTER to save and continue", "strong"),
                  ("MOVING AROUND", "head"),
                  "Wheel scroll    Shift+wheel sideways",
-                 "Ctrl+wheel or + -  zoom     0  fit",
-                 "Arrow keys  move around",
+                 "Ctrl+wheel/+ - zoom   0 fit   arrows move",
                  ("OTHER KEYS", "head"),
                  "Z undo     R clear all     Q quit",
                  "Colour tol slider: up = catch more holds",
@@ -1195,11 +1219,12 @@ def _interactive(reader, start_frame, fixed_img=None, fixed_label=None):
                  ("auto-found hold", "swatch_g"), ("manually added hold", "swatch_o"),
                  ("start hold", "swatch_c"), ("end hold", "swatch_r"),
                  ("volume (always allowed)", "swatch_w"), ("off-route hold on a volume", "swatch_p"),
+                 ("off-route hold on the wall", "swatch_x"),
                  ("STATUS", "head"),
                  (doing, "strong"),
                  f"Holds: {len(S['holds'])}    Start: {n_start}/2    End: {'yes' if n_end else 'no'}",
                  f"Volumes: {len(S['vols'])}  (coloured, skipped: {len(S.get('vols_skipped', []))})",
-                 f"Off-route holds cut out of volumes: {n_cut}",
+                 f"Off-route holds: {len(S['off'])} on the wall, {n_cut} on volumes",
                  f"{frame_txt}    Zoom: {S['zoom'] / fit * 100:.0f}%"]
         if S["msg"]:
             lines.append((S["msg"], "strong"))
@@ -1235,6 +1260,10 @@ def _interactive(reader, start_frame, fixed_img=None, fixed_label=None):
                                         deleted=[d["contour"] for d in S["deleted"]])
             S["auto_key"] = auto_key
             S["dirty"] = True
+        if (S["frame"], min_area) != S["off_key"]:      # every colourful hold on this picture (route or not)
+            S["off_cands"] = co.detect(S["fc"], min_area)
+            S["off_key"] = (S["frame"], min_area)
+            S["dirty"] = True
         if S["dirty"]:
             S["holds"] = combine(S["auto"], S["manual"], [], S["starts"], S["end"])
             vols = [dict(v) for v in S["vols_auto"]
@@ -1244,7 +1273,11 @@ def _interactive(reader, start_frame, fixed_img=None, fixed_label=None):
             vols += [dict(v) for v in S["vols_manual"]]
             S["vols"] = cvol.cut_foreign_holds(cvol.renumber(vols), S["img"],
                                                route_mask(S["holds"], S["img"].shape), min_area)
-            S["annotated"] = draw_volumes(draw_holds(S["img"], S["holds"], S["clicks"], header=False), S["vols"])
+            S["vols"] = co.drop_cuts(S["vols"], S["cuts_deleted"])
+            S["off"] = co.find_off_route(S["fc"], S["holds"], S["vols"], S["samples"], S["off_deleted"],
+                                         min_area, cands=S["off_cands"])
+            S["annotated"] = draw_volumes(draw_off_route(draw_holds(S["img"], S["holds"], S["clicks"], header=False),
+                                                         S["off"]), S["vols"])
             S["dirty"] = False
             S["view_dirty"] = True
         if S["view_dirty"] or canvas is None:
@@ -1289,7 +1322,8 @@ def _interactive(reader, start_frame, fixed_img=None, fixed_label=None):
                     "colour_samples_lab": [m["lab"] for m in S["samples"]], "colour_models": S["samples"],
                     "clicks": S["clicks"], "deleted_points": [d["pt"] for d in S["deleted"]],
                     "deleted_outlines": [d["contour"] for d in S["deleted"]],
-                    "volumes": S["vols"]}
+                    "volumes": S["vols"], "off_route": S["off"], "off_route_deleted": S["off_deleted"],
+                    "cuts_deleted": S["cuts_deleted"]}
             return S["img"], S["holds"], info
         if key in (27, ord("q")):
             cv2.destroyAllWindows()
@@ -1315,7 +1349,7 @@ def _interactive(reader, start_frame, fixed_img=None, fixed_label=None):
             undo(); S["dirty"] = True
         elif key == ord("r"):
             for k in ("samples", "clicks", "manual", "deleted", "history", "starts",
-                      "vols_manual", "vols_deleted"):
+                      "vols_manual", "vols_deleted", "off_deleted", "cuts_deleted"):
                 S[k].clear()
             S["end"] = None; S["tag"] = None
             S["dirty"] = True

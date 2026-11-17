@@ -39,6 +39,7 @@ import climb_analyze as ca         # noqa: E402
 import climb_holds as ch           # noqa: E402
 import climb_motion as cm          # noqa: E402
 import climb_notes as cn           # noqa: E402
+import climb_offroute as co        # noqa: E402
 import climb_pose as cp            # noqa: E402
 import climb_volumes as cvol       # noqa: E402
 from .cache import ByteLRU          # noqa: E402
@@ -81,6 +82,7 @@ class Job:
         self.touched = time.monotonic()
         self.discard = False           # freed while busy: free it when it stops
         self.cam, self.moved, self.keyframes = None, 0.0, None   # keyframes: set when the camera moved a lot
+        self.off_route, self.flag_off_route = [], True             # off-route wall holds (base pixels), flag touches?
 
     # ---------------------------------------------------------------- open + follow the camera
     def open(self, still):
@@ -205,8 +207,11 @@ class Job:
              deleted [{x, y, frame, contour}]  right-clicked holds' outlines (old: [x, y, frame])
              starts [[x, y, frame]], end [x, y, frame] or null
              vols_manual [{kind: "click", x, y, frame} | {kind: "poly", points, frame}], vols_deleted [[x, y, frame]]
+             off_deleted [{x, y, frame, contour}]  right-clicked off-route outlines (not really off-route holds)
+             cuts_deleted [[x, y, frame]]          right-clicked volume cut-outs (not really holds)
         Returns (img, holds, vols, info, extra) like climb_holds.interactive, plus counts for the page
         and rejected_auto ([{index, message}]: AUTO clicks that weren't on a hold).
+        info["off_route"] = the off-route holds on the plain wall (climb_offroute), same pixels as holds.
         With keyframes, holds + volumes come back in BASE-frame pixels (img = the base frame)."""
         st = self.clean_picker(st)
         if self.keyframes:
@@ -249,10 +254,14 @@ class Job:
             else:
                 vols.append(dict(vol, manual_index=k))
         vols = cvol.cut_foreign_holds(cvol.renumber(vols), img, ch.route_mask(holds, img.shape), min_area)
+        vols = co.drop_cuts(vols, [p[:2] for p in st.get("cuts_deleted", [])])
+        off_del, _ = split_deleted(st.get("off_deleted"), frame)
+        off = co.find_off_route(fc, holds, vols, models, [c for _, c in off_del], min_area,
+                                cands=self.cached(("offcands", frame, min_area), lambda: co.detect(fc, min_area)))
         info = {"frame": frame, "colour_tol": tol, "min_area_px": min_area,
                 "colour_samples_lab": [m["lab"] for m in models], "colour_models": models,
                 "clicks": [[c["x"], c["y"]] for c in st.get("auto", [])], "deleted_points": st.get("deleted", []),
-                "volumes": vols}
+                "volumes": vols, "off_route": off}
         return img, holds, vols, info, {"skipped_volumes": len(skipped), "failed_volumes": failed,
                                         "rejected_auto": rejected}
 
@@ -283,7 +292,7 @@ class Job:
         min_area = int(ch._fd(h, w)[1] * int(st.get("min_size", 3)) / 10000)
         outlines, points = split_deleted(st.get("deleted"), cur)
 
-        def deleted_on(f):                                 # deleted outlines, moved into frame f's pixels
+        def deleted_on(f, outlines=outlines):              # deleted outlines, moved into frame f's pixels
             return [cm.warp_points(c, self.cam[f] @ np.linalg.inv(self.cam[src])).tolist() for src, c in outlines]
         key = (tuple((on(c), int(c["x"]), int(c["y"])) for c in st.get("auto", [])), tol, min_area,
                tuple((src, len(c), tuple(c[0])) for src, c in outlines))
@@ -333,23 +342,41 @@ class Job:
         for f, vs in by_frame.items():                     # off-route holds are cut out on the frame they're seen in
             vs = cvol.cut_foreign_holds(vs, self.frame(f), ch.route_mask(ca.warp_holds(holds, self.cam[f]), (h, w)), min_area)
             vols += ca.warp_volumes(vs, to_base(f))
-        vols = cvol.renumber(vols)
+        vols = co.drop_cuts(cvol.renumber(vols), [pt_base(p) for p in st.get("cuts_deleted", [])])
+        off = self._off_route_keyframes(frames, holds, vols, models, min_area, deleted_on,
+                                        split_deleted(st.get("off_deleted"), cur)[0])
         n_skipped = sum(1 for _, f, v in skipped
                         if not any(cvol.inside_volume(o, center(ca.warp_volumes([v], to_base(f))[0]["contour"])) for o in vols))
 
         info = {"frame": self.base, "keyframes": frames, "colour_tol": tol, "min_area_px": min_area,
                 "colour_samples_lab": [m["lab"] for m in models], "colour_models": models,
                 "clicks": [[c["x"], c["y"], on(c)] for c in st.get("auto", [])],
-                "deleted_points": st.get("deleted", []), "volumes": vols}
+                "deleted_points": st.get("deleted", []), "volumes": vols, "off_route": off}
         return self.frame(self.base), holds, vols, info, {"skipped_volumes": n_skipped, "failed_volumes": failed,
                                                           "rejected_auto": rejected}
 
+    def _off_route_keyframes(self, frames, holds, vols, models, min_area, deleted_on, off_deleted):
+        """Off-route wall holds across the keyframes, in base pixels: found on each keyframe,
+        kept only if the other keyframes that show the spot agree (as for route holds), merged."""
+        h, w = self.height, self.width
+        sels = []
+        for f in frames:
+            fc = self.fc(f)
+            cands = self.cached(("offcands", f, min_area), lambda fc=fc: co.detect(fc, min_area))
+            sels.append(co.select(cands, ca.warp_holds(holds, self.cam[f]), models,
+                                  deleted_on(f, off_deleted), (h, w)))
+        sels = agree_across_keyframes(frames, sels, self.cam, (h, w), [], lambda f: self.fc(f).person())
+        cands = [(edge_room(hd["contour"], w, h), f, hd) for f, sel in zip(frames, sels) for hd in sel]
+        merged = [b for _, _, b in merge_views(cands, lambda f: np.linalg.inv(self.cam[f]), ca.warp_holds, ch.inside)]
+        return co.number(co.drop_on_volumes(merged, vols))
+
     def preview(self, st):
-        _, holds, vols, _, extra = self.build_route(st)
+        _, holds, vols, info, extra = self.build_route(st)
+        off = info.get("off_route", [])
         if self.keyframes:                                 # base-frame pixels -> the frame on screen
             Hm = self.cam[int(st.get("frame", self.keyframes[0]))]
-            holds, vols = ca.warp_holds(holds, Hm), ca.warp_volumes(vols, Hm)
-        return {"holds": holds, "volumes": vols, **extra}
+            holds, vols, off = ca.warp_holds(holds, Hm), ca.warp_volumes(vols, Hm), ca.warp_holds(off, Hm)
+        return {"holds": holds, "volumes": vols, "off_route": off, **extra}
 
     def route_for_analysis(self, st):
         """The marked route in BASE-frame pixels (also saved as <name>_holds.json / .png)."""
@@ -362,6 +389,7 @@ class Job:
             to_base = np.eye(3)                            # already there
         else:
             to_base = np.linalg.inv(self.cam[info["frame"]]) if self.cam is not None else np.eye(3)
+        self.off_route = ca.off_route_to_base(info, to_base)
         return ca.route_to_base(self.input, self.dir, True, img, holds, info, to_base, self.base)
 
     # ---------------------------------------------------------------- picker state from the page
@@ -482,6 +510,17 @@ def clean_picker(st, w, h, nframes, default_frame=0):
         else:
             deleted.append(click(d, what))
     out["deleted"] = deleted
+    off_deleted = []                                   # right-clicked off-route outlines: {x, y, frame, contour}
+    for k, d in enumerate(_items(st, "off_deleted")):
+        what = f"off_deleted[{k}]"
+        pts = d.get("contour") if isinstance(d, dict) else None
+        if not isinstance(pts, list) or len(pts) < 3 or not all(isinstance(q, (list, tuple)) and len(q) == 2 for q in pts):
+            raise PickerError(f"{what} should be an object with a contour of at least 3 [x, y] points.")
+        off_deleted.append({"x": _num(d.get("x", 0), f"{what} x"), "y": _num(d.get("y", 0), f"{what} y"),
+                            "frame": frame_of(d, what),
+                            "contour": [[_num(q[0], f"{what} contour x"), _num(q[1], f"{what} contour y")] for q in pts]})
+    out["off_deleted"] = off_deleted
+    out["cuts_deleted"] = [_point(p, f"cuts_deleted[{k}]", w, h, nframes) for k, p in enumerate(_items(st, "cuts_deleted"))]
 
     out["starts"] = [_point(p, f"starts[{k}]", w, h, nframes) for k, p in enumerate(_items(st, "starts"))]
     out["end"] = _point(st["end"], "end", w, h, nframes) if st.get("end") else None
@@ -634,12 +673,18 @@ def summarize(job, res, holds, vols):
             to = f"volume {n['hold']}" if isinstance(n["hold"], str) else f"hold {n['hold']}"
         notes.append({"start": n["start"], "end": n["end"], "text": n["text"], "to": to})
 
+    off = [{"t": e["t"], "dur": e["dur"], "limb": LIMB_NAMES.get(e["limb"], e["limb"]), "hold": e["hold"],
+            "on_volume": next((hd.get("volume") for hd in res.get("off_route_holds", []) if hd["id"] == e["hold"]), None)}
+           for e in res.get("off_route", [])]
+
     used = sorted({m["hold"] for m in moves if not m["volume"]})
     return {"frames": frames, "fps": round(fps, 2), "duration_s": round(frames / fps, 2),
             "detected": res["detected"], "detected_pct": round(100 * res["detected"] / max(frames, 1)),
             "holds_total": len(holds), "holds_used": len(used), "volumes": len(vols), "has_end": res["has_end"],
             "topped_s": round(res["topped_s"], 2) if res["topped_s"] is not None else None,
             "moves": moves, "angles": angles, "notes": notes,
+            "off_route": off, "off_route_enabled": bool(res.get("off_route_enabled")),
+            "off_route_holds": len(res.get("off_route_holds", [])),
             "video_url": f"/api/jobs/{job.id}/video", "download_url": f"/api/jobs/{job.id}/download",
             "csv_url": f"/api/jobs/{job.id}/csv"}
 
@@ -708,7 +753,7 @@ class Worker:
         for j in drop:
             j.free()
 
-    def start(self, job, picker_state, model, notes, use_lock):
+    def start(self, job, picker_state, model, notes, use_lock, flag_off_route=True):
         """picking/error -> starting -> queued. The first caller flips the state under the lock,
         so a second request (Enter plus a click) gets JobBusy instead of queueing the job twice."""
         with self.lock:
@@ -720,11 +765,12 @@ class Worker:
             if picker_state:
                 job.holds, job.vols = job.route_for_analysis(picker_state)
             else:
-                job.holds, job.vols = [], []
+                job.holds, job.vols, job.off_route = [], [], []
         except BaseException:
             job.state = before
             raise
         job.model, job.notes, job.use_lock = model, notes, use_lock
+        job.flag_off_route = bool(flag_off_route)
         job.cache.clear()                               # the picker's frames and colour data aren't needed any more
         job.state, job.stage, job.progress = "queued", "queued", 0.0
         job.message = "Waiting for the previous climb to finish"
@@ -765,7 +811,8 @@ class Worker:
         cam = job.cam if job.moved > 5 and job.holds else None    # still camera: nothing to warp (as in the CLI)
         res = ca.analyze_video(job.input, job.holds, job.vols, cam, job.model, job.dir, save_data=True,
                                show=False, use_lock=job.use_lock, note_args=job.notes,
-                               progress=progress, log=lambda msg: print(f"[{job.id}] {msg}"))
+                               progress=progress, log=lambda msg: print(f"[{job.id}] {msg}"),
+                               off_route=job.off_route, flag_off_route=job.flag_off_route and bool(job.holds))
         if res["frames"] == 0:
             raise ValueError("No frames could be read from the video")
         job.stage, job.message, job.progress = "encode", "Encoding the video for your browser", 1.0

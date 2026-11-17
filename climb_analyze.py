@@ -10,6 +10,9 @@ climb_analyze.py - holds + body tracking in one go.
         volumes      white outlines (always allowed; turn YELLOW when touched).
                      Off-route holds sitting on a volume are cut out (pink) - not allowed.
         "CONGRATULATIONS!" banner once both hands are on the END hold
+        possible off-route touch: a hand or foot resting on a hold that isn't on the
+                     route (another colour on the wall, or a cut-out on a volume)
+                     outlines that hold in orange-red with a label (--no-off-route: off)
      If the phone pans, tilts or zooms, the camera is tracked so every outline
      stays on its hold, and the picker shows the WHOLE wall stitched into one
      picture so the full route can be marked at once (--still skips this).
@@ -26,6 +29,7 @@ Usage:
     python climb_analyze.py IMG_5687.MOV --save-data                   # also save CSV + holds files
     python climb_analyze.py IMG_5687.MOV --holds IMG_5687_holds.json   # reuse saved holds, skip the picker
     python climb_analyze.py IMG_5687.MOV --model heavy --show
+    python climb_analyze.py IMG_5687.MOV --no-off-route                # don't flag off-route touches
 """
 
 import sys
@@ -46,6 +50,7 @@ from mediapipe.tasks.python import vision
 import climb_holds as ch
 import climb_motion as cm
 import climb_notes as cn
+import climb_offroute as co
 import climb_pose as cp
 import climb_volumes as cvol
 
@@ -177,20 +182,29 @@ def camera_moved(reader, cam):
     return max(float(np.abs(cm.warp_points(corners, Hm) - np.array(corners)).max()) for Hm in cam)
 
 
+def off_route_to_base(info, to_base):
+    """Off-route wall holds found by the picker (info["off_route"], picker pixels) -> BASE-frame
+    pixels. [] when the picker didn't look for them."""
+    return warp_holds(info.get("off_route") or [], to_base)
+
+
 def route_to_base(video, out_dir, save_files, img, holds, info, to_base, base):
-    """Holds + volumes marked on the picker image -> BASE-frame pixels (saved if asked)."""
+    """Holds + volumes marked on the picker image -> BASE-frame pixels (saved if asked).
+    The JSON also gets the off-route wall holds ("off_route", see off_route_to_base)."""
     vols = info.get("volumes", [])
     if save_files:
         ch.save(video, out_dir, img, holds, info)      # picture of what you marked
     holds_b, vols_b = warp_holds(holds, to_base), warp_volumes(vols, to_base)
     if save_files:                                     # data in base-frame pixels, reusable with --holds
         js = out_dir / f"{video.stem}_holds.json"
-        js.write_text(json.dumps({"video": video.name, "frame": base, "holds": holds_b, "volumes": vols_b}, indent=1))
+        js.write_text(json.dumps({"video": video.name, "frame": base, "holds": holds_b, "volumes": vols_b,
+                                  "off_route": off_route_to_base(info, to_base)}, indent=1))
     return holds_b, vols_b
 
 
 def pick_holds(video, start_frame, out_dir, save_files, cam=None, base=0):
-    """Open the picker and return holds + volumes in BASE-frame pixels.
+    """Open the picker and return holds, volumes, how far the camera moved and the off-route
+    wall holds, all in BASE-frame pixels.
     If the camera moved, the picker shows a stitched panorama of the whole wall so the
     entire route can be marked at once; otherwise a normal frame with a Frame slider."""
     reader = ch.FrameReader(video)
@@ -214,11 +228,12 @@ def pick_holds(video, start_frame, out_dir, save_files, cam=None, base=0):
         to_base = np.linalg.inv(cam[info["frame"]]) if cam is not None else np.eye(3)
     holds_b, vols_b = route_to_base(video, out_dir, save_files, img, holds, info, to_base, base)
     print(f"Marked {len(holds)} holds and {len(vols)} volumes.")
-    return holds_b, vols_b, moved
+    return holds_b, vols_b, moved, off_route_to_base(info, to_base)
 
 
 def analyze_video(video, holds, vols, cam, model="full", out_dir=None, save_data=False, show=False,
-                  use_lock=True, note_args=(), notes_file=None, progress=None, log=print):
+                  use_lock=True, note_args=(), notes_file=None, progress=None, log=print,
+                  off_route=None, flag_off_route=True):
     """Everything after the route is marked: lock each hold onto the wall, track the climber
     (pass 1), pin the sticky notes, then draw and write the annotated video (pass 2).
     Callable from other code (the web app); main() uses it for the CLI.
@@ -229,9 +244,14 @@ def analyze_video(video, holds, vols, cam, model="full", out_dir=None, save_data
     progress     optional callback(stage, done, total), stage = "lock" / "track" / "draw";
                  when given, the console progress counters aren't printed
     log          where status lines go (print for the CLI)
+    off_route    off-route wall holds in BASE-frame pixels (*_holds.json "off_route"); the
+                 volumes' cut-outs count as off-route too
+    flag_off_route  False: don't look for off-route touches at all
 
     Returns a dict: out_video, out_csv (or None), fps, frames, detected, has_end, topped_s,
-    notes, and per frame `limb_holds` ({limb: hold id / volume id / ""}) and `angles`.
+    notes, per frame `limb_holds` ({limb: hold id / volume id / ""}) and `angles`, and
+    `off_route` (possible off-route touches: [{limb, hold, start, end (frames, end exclusive),
+    t, dur (s)}]), `off_route_holds` (the holds checked, base pixels) and `off_route_enabled`.
     """
     video = Path(video)
     out_dir = Path(out_dir) if out_dir else video.parent
@@ -270,6 +290,12 @@ def analyze_video(video, holds, vols, cam, model="full", out_dir=None, save_data
     header += [f"{limb}_hold" for limb in LIMBS]
 
     notes = cn.load_notes(note_args, notes_file)
+    # off-route holds (wall + volume cut-outs), base pixels: a limb inside one is checked for a touch
+    off_holds = co.all_off_route(off_route or [], vols) if flag_off_route else []
+    off_cnts = [(hd["id"], np.array(hd["contour"], np.int32).reshape(-1, 1, 2)) for hd in off_holds]
+    off_tracks = {limb: [] for limb in LIMBS}     # per frame: (off-route hold id or "", base point or None)
+    csv_rows = []                                 # written once the off-route touches are known
+    frame_min = 0
     detected, frame_i = 0, 0
     both_on_end, topped_frame = 0, None
     hold_needed = max(3, int(round(0.2 * fps)))   # both hands on the END hold for ~0.2 s = topped
@@ -294,15 +320,13 @@ def analyze_video(video, holds, vols, cam, model="full", out_dir=None, save_data
         return hf, vf, [(hd["id"], np.array(hd["contour"], np.int32).reshape(-1, 1, 2)) for hd in hf]
 
     # ---- pass 1: pose + contacts (nothing drawn yet, so notes can look ahead)
-    with vision.PoseLandmarker.create_from_options(options) as landmarker, \
-            open(out_csv if save_data else os.devnull, "w", newline="") as f:
-        rows = csv.writer(f)
-        rows.writerow(header)
+    with vision.PoseLandmarker.create_from_options(options) as landmarker:
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
             h, w = frame.shape[:2]
+            frame_min = min(h, w)
             reach = min(h, w) * 0.02            # how close a hand/foot must be to count as "on" a hold
             holds_f, vols_f, hold_cnts = frame_layout(frame_i)
             end_cnt = next((c for hd, (hid, c) in zip(holds_f, hold_cnts) if hd.get("role") == "end"), None)
@@ -344,7 +368,7 @@ def analyze_video(video, holds, vols, cam, model="full", out_dir=None, save_data
                 row.append(0)
                 row += [""] * (len(header) - len(LIMBS) - len(row))
             row += [on_hold[limb] for limb in LIMBS]
-            rows.writerow(row)
+            csv_rows.append(row)
             angles.append(dict(zip(cp.ANGLES, row[-len(LIMBS) - len(cp.ANGLES):-len(LIMBS)])) if pts is not None else {})
             base_pts = {}
             if pts is not None:
@@ -352,6 +376,12 @@ def analyze_video(video, holds, vols, cam, model="full", out_dir=None, save_data
                 for limb, idx in LIMBS.items():
                     if on_hold[limb] != "":
                         base_pts[limb] = tuple(cm.warp_points([pts[idx]], to_base)[0])
+            for limb, idx in LIMBS.items():           # off-route: only a visible limb on no route hold / volume
+                hit, bp = "", None
+                if off_cnts and pts is not None and vis[idx] >= cp.MIN_VIS and on_hold[limb] == "":
+                    bp = tuple(cm.warp_points([pts[idx]], to_base)[0])
+                    hit = co.hold_at(off_cnts, bp)
+                off_tracks[limb].append((hit, bp if hit else None))
             records.append({"pts": pts, "vis": vis, "on_hold": on_hold, "touched": touched, "base_pts": base_pts})
             frame_i += 1
             if progress:
@@ -361,6 +391,19 @@ def analyze_video(video, holds, vols, cam, model="full", out_dir=None, save_data
     cap.release()
     if not progress:
         print()
+
+    # ---- possible off-route touches: sustained, and the limb roughly still on the wall
+    off_events = co.touch_events(off_tracks, fps, frame_min or 1) if off_cnts else []
+    for e in off_events:
+        e["t"], e["dur"] = round(e["start"] / fps, 2), round((e["end"] - e["start"]) / fps, 2)
+    flags = co.flags_per_frame(off_events, len(records))
+    if flag_off_route:
+        log(f"Possible off-route touches: {len(off_events)} (checked {len(off_holds)} off-route holds)")
+    with open(out_csv if save_data else os.devnull, "w", newline="") as f:
+        rows = csv.writer(f)
+        rows.writerow(header + ["off_route_touch"])     # new column last: every older column keeps its place
+        for row, fl in zip(csv_rows, flags):
+            rows.writerow(row + [";".join(f"{limb}:{hid}" for hid, limbs in sorted(fl.items()) for limb in limbs)])
 
     # ---- notes: decide which hold each one points at
     if notes:
@@ -384,6 +427,10 @@ def analyze_video(video, holds, vols, cam, model="full", out_dir=None, save_data
         if not topped:                                # hold outlines disappear once you've topped
             draw_volumes_layer(frame, vols_f, rec["touched"])
             draw_holds_layer(frame, holds_f, hold_cnts, rec["touched"])
+        if flags[fi]:                                 # possible off-route touch: warning outline + label
+            Hm = cam[fi] if cam is not None and fi < len(cam) else np.eye(3)
+            co.draw_flags(frame, [(cm.warp_points(hd["contour"], Hm), co.LABEL)
+                                  for hd in off_holds if hd["id"] in flags[fi]])
         if rec["pts"] is not None:
             cp.draw(frame, rec["pts"], rec["vis"])
         hip = None
@@ -423,7 +470,8 @@ def analyze_video(video, holds, vols, cam, model="full", out_dir=None, save_data
     return {"out_video": out_video, "out_csv": out_csv if save_data else None, "fps": fps,
             "frames": frame_i, "detected": detected, "has_end": has_end,
             "topped_s": topped_frame / fps if topped_frame is not None else None,
-            "limb_holds": [r["on_hold"] for r in records], "angles": angles, "notes": notes}
+            "limb_holds": [r["on_hold"] for r in records], "angles": angles, "notes": notes,
+            "off_route": off_events, "off_route_holds": off_holds, "off_route_enabled": bool(flag_off_route)}
 
 
 def main():
@@ -442,6 +490,8 @@ def main():
     ap.add_argument("--note", action="append", default=[], metavar='"20-21 footswap"',
                     help='sticky note: "start-end text [@hold]" (repeatable)')
     ap.add_argument("--notes", default=None, help="text file of sticky notes, one per line")
+    ap.add_argument("--no-off-route", action="store_true",
+                    help="don't look for (or flag) touches of holds that aren't on the route")
     args = ap.parse_args()
 
     video = Path(args.video)
@@ -470,19 +520,23 @@ def main():
     # ---- step 2: holds
     if data:
         holds, vols = data["holds"], data.get("volumes", [])
+        off = data.get("off_route", [])                 # older files have none: only volume cut-outs are checked
         print(f"Loaded {len(holds)} holds from {args.holds}")
     else:
-        holds, vols, moved = pick_holds(video, args.frame, out_dir, args.save_data, cam, base)
+        holds, vols, moved, off = pick_holds(video, args.frame, out_dir, args.save_data, cam, base)
         if cam is not None and moved <= 5:
             cam = None                                   # camera was still: no need to warp anything
     # ---- steps 3-5: lock-on, tracking, notes, drawing
     res = analyze_video(video, holds, vols, cam, args.model, out_dir, args.save_data, args.show,
-                        use_lock=not args.no_lock, note_args=args.note, notes_file=args.notes)
+                        use_lock=not args.no_lock, note_args=args.note, notes_file=args.notes,
+                        off_route=off, flag_off_route=not args.no_off_route)
     detected, frame_i = res["detected"], res["frames"]
     print(f"\nDone: climber detected in {detected}/{frame_i} frames ({100 * detected / max(frame_i, 1):.0f}%)")
     if res["has_end"]:
         print(f"  Topped at {res['topped_s']:.1f}s!" if res["topped_s"] is not None
               else "  Both hands never matched on the END hold.")
+    for e in res["off_route"]:
+        print(f"  Possible off-route touch: {e['limb']} on {e['hold']} at {e['t']:.1f}s for {e['dur']:.1f}s")
     print(f"  video -> {res['out_video']}")
     if args.save_data:
         print(f"  data  -> {res['out_csv']}")

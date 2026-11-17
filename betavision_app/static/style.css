@@ -200,6 +200,9 @@ code { font: 12px var(--mono); background: var(--wall); border-radius: 4px; padd
 .sw.manual { background: #e38b2c; }
 .sw.vol { background: #d9d6cf; box-shadow: 0 0 0 1px #6b675f; }
 .sw.cut { background: #ff69b4; }
+.sw.off { background: #ff4500; }
+.offroute-list li { grid-template-columns: auto 1fr auto; }
+.offroute-list .n { border-color: #ff4500; color: #ff4500; }
 .status-box { display: flex; flex-direction: column; gap: 8px; padding-top: 16px; border-top: 1px solid var(--line); font: 12px var(--mono); color: var(--muted); }
 .now { font: 700 13.5px "Manrope", system-ui, sans-serif; color: var(--ink); margin-bottom: 2px; }
 .kv { display: flex; justify-content: space-between; gap: 12px; }

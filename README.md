@@ -34,10 +34,11 @@ Built with Python, OpenCV and MediaPipe Pose.
 - **Handheld / panning video.** The camera is tracked frame by frame (Lucas-Kanade optical flow, chained homographies), with drift corrected every few frames by ORB feature matching against the marked frame or the last good checkpoint. Every hold and volume outline is warped into each frame, so outlines stay on their holds while the phone pans, tilts or zooms.
 - **Whole-wall panorama.** If the camera moved, the frames are stitched into one picture of the whole wall (a per-pixel median, which also erases the climber) and the route is marked on that.
 - **Contact detection.** Each hand and foot is matched to the nearest hold contour every frame, or to a volume if it isn't on a hold. Holds and volumes turn yellow while they're being used.
+- **Possible off-route touches.** The picker also outlines the holds that *aren't* on the route: every hold-like blob of another colour on the wall (found with the same colour segmentation and climber mask as the route's holds, one colour model per hue seen on the wall), plus the off-route holds cut out of volumes. They follow the camera like the route does. A hand or foot is flagged only when it stays inside one of them for about 0.6 s or more *and* stays roughly still on the wall over that time (within ~3% of the frame, and not sliding along), so a limb swinging past in front of a hold isn't flagged; feet smearing on bare wall and anything on a volume are allowed. The hold is outlined orange-red with a *possible off-route* label for as long as the touch lasts, listed in the web app's results, and written to the CSV. Right-click a wrong off-route outline in the picker to remove it; `--no-off-route` (or the page's checkbox) turns the feature off.
 - **Sticky-note annotations.** Add notes like `20-21 footswap`; each appears as a sticky note pinned to a hold for that time window and follows the hold if the camera moves. Without a hold number it pins itself to the hold in use then (feet for foot moves, hands for hand moves).
 - **Top-out detection.** When both hands match on the end hold, a *CONGRATULATIONS!* banner appears with the time, and the hold overlays clear away.
 - **Interactive picker UI.** Scrub through the video, zoom (up to 4x) and scroll to mark small holds precisely, undo any action, with an on-screen instructions panel.
-- **Clean output.** Saves a single annotated video by default. Optional per-frame CSV (joint positions, elbow/knee/hip angles, which hold each limb is on) with `--save-data`.
+- **Clean output.** Saves a single annotated video by default. Optional per-frame CSV (joint positions, elbow/knee/hip angles, which hold each limb is on, and an `off_route_touch` column such as `l_foot:X3` while a possible off-route touch lasts) with `--save-data`.
 
 ## How it works
 
@@ -53,9 +54,9 @@ video ──► camera tracking (optical flow + ORB re-anchoring) ─► homogra
             │  33 landmarks ─► 16 joints, joint angles
             ▼
           outlines warped into each frame ─► contact check: hand/foot ↔ hold, else volume
-            │
+            │  else inside an off-route hold? ─► held still ≥ ~0.6 s ─► possible off-route touch
             ▼
-          annotated video: holds, skeleton, touched holds, top-out banner
+          annotated video: holds, skeleton, touched holds, off-route flags, top-out banner
 ```
 
 | File | What it does |
@@ -63,6 +64,7 @@ video ──► camera tracking (optical flow + ORB re-anchoring) ─► homogra
 | `climb_analyze.py` | **Main program.** Runs the hold picker, then tracks the climber and writes the annotated video. |
 | `climb_holds.py` | Hold picker and hold detection (usable on its own). |
 | `climb_volumes.py` | Volume detection and off-route hold cut-outs. |
+| `climb_offroute.py` | Off-route holds on the wall and the rules for flagging a touch of one. |
 | `climb_motion.py` | Camera tracking and whole-wall panorama stitching. |
 | `climb_notes.py` | Sticky-note annotations. |
 | `climb_pose.py` | Pose tracking only: skeleton video + per-frame CSV (usable on its own). |
@@ -93,6 +95,7 @@ python climb_analyze.py my_climb.mov
    - **Right-click** wrong detections to delete them. Press **M** and click any holds it missed.
    - Press **S** and click each start hold, then press **E** and click the end hold.
    - Volumes are outlined automatically. Right-click a wrong one to remove it. For a missed one press **V** and click it, or press **P** and click its corners for an exact outline (click the first corner again, or press Enter, to finish).
+   - Holds of other colours are outlined thin orange-red: they're off-route, and resting a hand or foot on one is flagged. Right-click one that isn't really a hold (a sticker, a mat) to remove it, and right-click a pink cut-out on a volume that isn't a hold to put it back into the volume.
    - Press **Enter**.
 2. Wait for tracking to finish. Output: `my_climb_analysis.mp4`.
 
@@ -101,7 +104,7 @@ python climb_analyze.py my_climb.mov
 | Key / mouse | Action |
 |---|---|
 | Left click | AUTO: find all holds of this colour (a click on an already-selected hold, bare wall or the climber adds nothing) · MANUAL: add this one hold |
-| Right click | Delete the hold (or volume) under the cursor; it stays deleted at any colour tolerance |
+| Right click | Delete the hold (or volume) under the cursor; it stays deleted at any colour tolerance. On an off-route outline or a volume cut-out: remove just that |
 | `M` | Switch AUTO / MANUAL |
 | `S` / `E` | Next click tags a START / END hold |
 | `V` | Next click auto-outlines a volume the auto-detect missed |
@@ -141,7 +144,10 @@ python climb_analyze.py my_climb.mov --holds my_climb_holds.json   # reuse marke
 python climb_analyze.py my_climb.mov --model heavy          # more accurate, slower (lite/full/heavy)
 python climb_analyze.py my_climb.mov --show                 # live preview while tracking
 python climb_analyze.py my_climb.mov --still                # tripod video: skip camera tracking
+python climb_analyze.py my_climb.mov --no-off-route         # don't flag touches of off-route holds
 ```
+
+Saved `*_holds.json` files now also hold the off-route wall holds (`"off_route"`), so `--holds` reuses them. Files saved before this have none; they still load, and only the off-route cut-outs on volumes are checked.
 
 ## Web app (Windows)
 
@@ -163,8 +169,8 @@ Prefer clicking to typing commands? BetaVision also runs as a local web app. It 
 1. Drag a video (.mp4, .mov or .avi) onto the page, or click to browse. Tick *Filmed on a tripod* to skip camera tracking (same as `--still`).
 2. BetaVision follows the camera. If it moved, it picks a few sharp frames that between them show the whole wall (a strip under the picture; **[** and **]** step through them). Mark each hold once, on whichever frame shows it best; holds found on one frame are shown on all of them. If the climber hides a hold on every one of them, drag the Frame slider to a better moment and click *Add this frame*. If the camera didn't move, you mark a frame you choose with the slider.
 3. Mark the route just like the OpenCV picker: click one hold to find every hold of that colour, switch to *Just this hold* (**M**) for any it missed, right-click wrong holds or volumes, tag start (**S**) and end (**E**) holds. Volumes are found for you; add a missed one with **V** (click it) or **P** (click its corners). Scroll to zoom, drag to move. Or choose *Skip holds* to track the body only.
-4. Optionally type sticky notes, one per line, in the same format as a notes file (see [Sticky notes](#sticky-notes)).
-5. Click **Analyze climb**. When it's done you get the annotated video in the page, the results (how much of the climb was tracked, top-out time, holds used, the hold and volume sequence, where each note was pinned, joint angle ranges) and a **Download annotated video** button.
+4. Optionally type sticky notes, one per line, in the same format as a notes file (see [Sticky notes](#sticky-notes)). Untick *Flag possible off-route touches* to turn that off (orange-red dashed outlines in the picker are the off-route holds; right-click a wrong one).
+5. Click **Analyze climb**. When it's done you get the annotated video in the page, the results (how much of the climb was tracked, top-out time, holds used, the hold and volume sequence, possible off-route touches, where each note was pinned, joint angle ranges; click a move or a flag to jump there) and a **Download annotated video** button.
 
 Uploads and results are kept in a `workspace/` folder next to the app, which is emptied every time the app starts. Download anything you want to keep. The route you marked is saved there too as `<name>_holds.json`, reusable with the command line's `--holds`.
 
@@ -196,7 +202,7 @@ Measured on 16 generated walls with uneven lighting, chalk, panel seams, bolt ho
 | Outline position while panning (rough handheld shake, motion blur, zoom, tilt) | median ~2 px off, worst frame ~15 px; without tracking: ~500 px |
 | Speed | volumes ~0.3 s per frame, holds: first click on a frame ~0.3–0.5 s (outlining the hold, finding the climber), each refresh after that ~0.05–0.1 s, camera tracking ~20 ms per frame, stitching ~5 s |
 
-These are results on synthetic walls; real gym footage will vary. On 40 clicks across 6 real gym videos (`tools/eval_colour_pick.py`), the clicked hold was in the result every time.
+These are results on synthetic walls; real gym footage will vary. Off-route touch flags, checked frame by frame on three real handheld clips: one flag, correct (a hand resting on a white hold on a volume during a yellow route, 4 s); no false alarms on the other two, including a climber whose feet smear beside green holds. That's too few clips to give a rate. On 40 clicks across 6 real gym videos (`tools/eval_colour_pick.py`), the clicked hold was in the result every time.
 
 ## Limitations
 
@@ -209,12 +215,15 @@ These are results on synthetic walls; real gym footage will vary. On 40 clicks a
 - Camera tracking assumes a flat wall. Strong overhangs or roofs filmed from close up bend the geometry and outlines can drift slightly.
 - Very fast whip-pans with heavy motion blur can lose tracking for a moment.
 - Top-out requires both hands matched on the end hold.
+- Off-route flags are a hint, not a judgement: pose landmarks are 2D, so a hand or foot held still *in front of* a hold looks the same as one on it. The rules lean towards missing a touch rather than raising a false alarm: under ~0.6 s, a limb that slides slowly across a hold, or one within ~2% of the frame of a route hold, isn't flagged.
+- Only coloured off-route holds are found on the wall. White, grey and black ones are not (on volumes they are, as cut-outs). Colourful things that aren't holds (mats, tape, signs, clothes) can show up as off-route outlines; right-click them in the picker. Off-route holds the climber hides in every picker frame are missed.
+- A painted volume of another colour is treated as an off-route hold if it's small enough to look like one.
 
 ## Roadmap
 
 - [ ] Compare two climbers on the same route (normalized joints + dynamic time warping)
 - [x] Volume detection, with off-route holds on volumes excluded
-- [ ] Flag off-route hold touches in the video
+- [x] Flag off-route hold touches in the video
 - [x] Camera-motion compensation (feature tracking / homography) and whole-wall panorama
 - [ ] Native iOS app (Swift, AVFoundation, Apple Vision)
 - [ ] Beta suggestions learned from recorded move sequences

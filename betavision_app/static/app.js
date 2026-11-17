@@ -6,11 +6,11 @@
 const $ = (id) => document.getElementById(id);
 const STEPS = ["step-upload", "step-holds", "step-run", "step-results", "step-error"];
 const VIDEO_EXT = [".mp4", ".mov", ".avi"];
-const COLORS = { auto: "#3fae5a", manual: "#e38b2c", start: "#1fb8c9", end: "#d0473b", vol: "#ebebeb", cut: "#ff69b4" };
+const COLORS = { auto: "#3fae5a", manual: "#e38b2c", start: "#1fb8c9", end: "#d0473b", vol: "#ebebeb", cut: "#ff69b4", off: "#ff4500" };
 
 let job = null;          // {id, name, frames, fps, width, height, keyframes, camera_moved}
 let P = null;            // picker state sent to the server (see jobs.Job.build_route)
-let holds = [], vols = [], skippedVols = 0;
+let holds = [], vols = [], offs = [], skippedVols = 0;   // offs: off-route holds on the wall (this frame's pixels)
 let mode = "AUTO", tag = null, poly = [], history = [];
 let img = new Image(), view = { s: 1, ox: 0, oy: 0, fit: 1 };
 let pollTimer = null, jobId = null;
@@ -160,8 +160,9 @@ function startPicker(info) {
   job = info;
   const first = job.keyframes ? job.keyframes[0] : 0;
   P = { frame: first, frames: job.keyframes ? job.keyframes.slice() : null, tol: 22, min_size: 3,
-        auto: [], manual: [], deleted: [], starts: [], end: null, vols_manual: [], vols_deleted: [] };
-  holds = []; vols = []; history = []; poly = []; tag = null; setMode("AUTO");
+        auto: [], manual: [], deleted: [], starts: [], end: null, vols_manual: [], vols_deleted: [],
+        off_deleted: [], cuts_deleted: [] };
+  holds = []; vols = []; offs = []; history = []; poly = []; tag = null; setMode("AUTO");
   $("keyframes").hidden = $("add-frame").hidden = !job.keyframes;
   $("strip").dataset.html = "";
   $("frame").max = Math.max(0, job.frames - 1);
@@ -200,8 +201,8 @@ function goToFrame(i) {
 }
 
 // ---------- keyframes (camera moved): a few frames that between them show the whole wall
-const hasMarks = (f) => [P.auto, P.manual, P.vols_manual, P.deleted].some((list) => list.some((c) => c.frame === f)) ||
-  [P.starts, P.vols_deleted, P.end ? [P.end] : []].some((list) => list.some((p) => p[2] === f));
+const hasMarks = (f) => [P.auto, P.manual, P.vols_manual, P.deleted, P.off_deleted].some((list) => list.some((c) => c.frame === f)) ||
+  [P.starts, P.vols_deleted, P.cuts_deleted, P.end ? [P.end] : []].some((list) => list.some((p) => p[2] === f));
 
 function renderStrip() {
   if (!P.frames) return;
@@ -312,6 +313,11 @@ function draw() {
       path(e); ctx.lineWidth = 2 / view.s; ctx.strokeStyle = COLORS.cut; ctx.stroke();
     }
   }
+  ctx.setLineDash([6 / view.s, 4 / view.s]);    // off-route holds on the wall: thin dashed orange-red
+  for (const o of offs) {
+    path(o.contour); ctx.lineWidth = 1.5 / view.s; ctx.strokeStyle = COLORS.off; ctx.stroke();
+  }
+  ctx.setLineDash([]);
   for (const h of holds) {
     const color = h.role ? COLORS[h.role] : COLORS[h.source] || COLORS.auto;
     path(h.contour);
@@ -440,6 +446,8 @@ function onClick(pt, right) {
   else {                                         // right click: delete a hold, else a volume
     const m = holds.find((h) => h.manual_index != null && inside(h, pt));
     const mv = vols.find((v) => v.manual_index != null && inside(v, pt));
+    const off = offs.find((o) => inside(o, pt));
+    const cut = vols.some((v) => (v.exclude || []).some((e) => insidePoly(e, pt)));
     if (m) {
       history.push(["unmanual", P.manual[m.manual_index], m.manual_index]);
       P.manual.splice(m.manual_index, 1);
@@ -448,6 +456,10 @@ function onClick(pt, right) {
       // or colour samples do later, and never takes a different hold with it
       const hit = holds.filter((h) => inside(h, pt)).reduce((a, b) => ((a.area || 0) <= (b.area || 0) ? a : b));
       P.deleted.push({ x: pt[0], y: pt[1], frame: P.frame, contour: hit.contour }); history.push("deleted");
+    } else if (off) {                            // an off-route outline that isn't really a hold
+      P.off_deleted.push({ x: pt[0], y: pt[1], frame: P.frame, contour: off.contour }); history.push("off_deleted");
+    } else if (cut) {                            // a cut-out on a volume that isn't really a hold
+      P.cuts_deleted.push([...pt, P.frame]); history.push("cut_deleted");
     } else if (mv) {
       history.push(["unvol", P.vols_manual[mv.manual_index], mv.manual_index]);
       P.vols_manual.splice(mv.manual_index, 1);
@@ -466,6 +478,8 @@ function undo() {
   else if (last === "deleted") P.deleted.pop();
   else if (last === "vol_manual") P.vols_manual.pop();
   else if (last === "vol_deleted") P.vols_deleted.pop();
+  else if (last === "off_deleted") P.off_deleted.pop();
+  else if (last === "cut_deleted") P.cuts_deleted.pop();
   else if (last[0] === "starts") P.starts = last[1];
   else if (last[0] === "end") P.end = last[1];
   else if (last[0] === "unmanual") P.manual.splice(last[2], 0, last[1]);
@@ -475,7 +489,8 @@ function undo() {
 }
 
 function clearAll() {
-  Object.assign(P, { auto: [], manual: [], deleted: [], starts: [], end: null, vols_manual: [], vols_deleted: [] });
+  Object.assign(P, { auto: [], manual: [], deleted: [], starts: [], end: null, vols_manual: [], vols_deleted: [],
+                     off_deleted: [], cuts_deleted: [] });
   history = []; poly = []; setTag(null);
   renderStrip();
   refreshRoute();
@@ -525,7 +540,7 @@ async function sendRoute() {
       refreshRoute();
     } else {
       if (!data.failed_volumes.length && !(data.rejected_auto || []).length) {
-        holds = data.holds; vols = data.volumes; skippedVols = data.skipped_volumes;
+        holds = data.holds; vols = data.volumes; offs = data.off_route || []; skippedVols = data.skipped_volumes;
         updateStatus(); draw();
         if (P.frames) renderStrip();             // a frame's × hides once it has marks
       }                                          // (else: the newer state that's queued sorts it out)
@@ -571,7 +586,8 @@ function updateStatus() {
   $("n-end").textContent = `End ${hasEnd ? "✓" : "—"}`;
   $("n-vols").textContent = `${vols.length} volume${vols.length === 1 ? "" : "s"}` +
     (skippedVols ? ` (${skippedVols} painted, skipped)` : "");
-  $("n-cuts").textContent = nCut ? `${nCut} off-route cut out` : "";
+  $("n-cuts").textContent = nCut || offs.length
+    ? `Off-route: ${offs.length} on the wall` + (nCut ? `, ${nCut} cut out of volumes` : "") : "";
   $("analyze").disabled = holds.length === 0 || starting;
   $("skip").disabled = starting;
   $("undo").disabled = history.length === 0;
@@ -666,6 +682,7 @@ async function analyze(withHolds) {
   try {
     await api(`/api/jobs/${job.id}/start`, {
       picker: withHolds ? P : null, model: $("model").value, notes: $("notes").value, lock: $("lock").checked,
+      off_route: $("offroute").checked,
     });
   } catch (e) {
     if (e.message.startsWith("Sticky notes")) { $("notes-error").textContent = e.message; $("notes-error").hidden = false; $("notes").focus(); }
@@ -718,6 +735,16 @@ function showResults(r) {
   $("moves-count").textContent = r.moves.length ? `${r.moves.length} move${r.moves.length === 1 ? "" : "s"}` : "";
   moves.querySelectorAll("li[data-i]").forEach((li) => li.addEventListener("click", () => seek(r.moves[+li.dataset.i].t)));
 
+  const offr = r.off_route || [];
+  $("offroute-block").hidden = !r.off_route_enabled;
+  $("offroute-count").textContent = offr.length ? `${offr.length} flagged` : "";
+  $("offroute-list").innerHTML = offr.length ? offr.map((o, i) =>
+    `<li data-i="${i}"><span class="n">!</span>` +
+    `<span class="what"><span>${esc(o.limb)} on off-route hold ${esc(o.hold)}${o.on_volume ? ` (on volume ${esc(o.on_volume)})` : ""}</span>` +
+    `<span class="t">[${fmt(o.t)}]</span></span><span class="d">${fmt(o.dur)}</span></li>`).join("")
+    : `<li class="empty">${r.off_route_holds ? "None flagged." : "No off-route holds were found, so there was nothing to flag."}</li>`;
+  $("offroute-list").querySelectorAll("li[data-i]").forEach((li) => li.addEventListener("click", () => seek(offr[+li.dataset.i].t)));
+
   $("notes-block").hidden = !r.notes.length;
   $("notes-list").innerHTML = r.notes.map((n, i) =>
     `<li data-i="${i}"><span class="n">${i + 1}</span><span class="what"><span>${esc(n.text)}</span>` +
@@ -738,7 +765,7 @@ function restart() {
   clearTimeout(refreshTimer); dirty = false; setPending(false);
   $("player").removeAttribute("src");
   $("player").load();
-  job = null; P = null; holds = []; vols = []; jobId = null;
+  job = null; P = null; holds = []; vols = []; offs = []; jobId = null;
   fileInput.value = "";
   drop.hidden = false;
   $("still-row").hidden = false;

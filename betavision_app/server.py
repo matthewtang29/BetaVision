@@ -53,6 +53,7 @@ class StartRequest(BaseModel):
     model: str = "full"
     notes: str = ""                 # sticky notes, one per line (as in a --notes file)
     lock: bool = True               # fine-tune each hold per frame (CLI: unless --no-lock)
+    off_route: bool = True          # flag possible off-route touches (CLI: unless --no-off-route)
 
 
 @app.post("/api/upload")
@@ -97,7 +98,7 @@ def start(job_id: str, req: StartRequest):
     except ValueError as e:
         raise HTTPException(400, f"Sticky notes: {e}")
     picker = job.clean_picker(req.picker) if req.picker else None     # 400 with a readable message
-    worker.start(job, picker, req.model if req.model in MODELS else "full", notes, req.lock)
+    worker.start(job, picker, req.model if req.model in MODELS else "full", notes, req.lock, req.off_route)
     return job.status()
 
 
