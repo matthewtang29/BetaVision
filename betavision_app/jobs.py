@@ -15,6 +15,7 @@ Nothing here opens an OpenCV window.
 """
 
 import math
+import os
 import queue
 import re
 import shutil
@@ -24,7 +25,7 @@ import sys
 import threading
 import traceback
 import uuid
-from collections import OrderedDict
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -40,11 +41,23 @@ import climb_motion as cm          # noqa: E402
 import climb_notes as cn           # noqa: E402
 import climb_pose as cp            # noqa: E402
 import climb_volumes as cvol       # noqa: E402
+from .cache import ByteLRU          # noqa: E402
 
 WORKSPACE = ROOT / "workspace"     # uploads + outputs, wiped every time the app starts
 VIDEO_TYPES = {".mp4", ".mov", ".avi"}
 LIMB_NAMES = {"l_hand": "Left hand", "r_hand": "Right hand", "l_foot": "Left foot", "r_foot": "Right foot"}
 ANGLE_NAMES = {"elbow": "Elbows", "knee": "Knees", "hip": "Hips"}
+CACHE_BYTES = int(float(os.environ.get("BETAVISION_CACHE_MB", 1536)) * 1024 * 1024)   # per job: frames, colour data, outlines
+MAX_KEPT_JOBS = 4         # jobs that aren't busy (picking / done / failed) kept in memory; the least recently used are freed
+BUSY = ("uploading", "preparing", "starting", "queued", "running")
+
+
+class PickerError(ValueError):
+    """The picker state sent by the page isn't usable. The message is shown to the user (HTTP 400)."""
+
+
+class JobBusy(Exception):
+    """The job isn't in a state that allows starting (already started)."""
 
 
 def reset_workspace():
@@ -62,9 +75,11 @@ class Job:
         self.input = self.dir / f"{self.name}{p.suffix.lower()}"
         self.state, self.stage, self.message, self.progress = "uploading", "", "", 0.0
         self.results = None
-        self.lock = threading.Lock()   # cv2.VideoCapture isn't thread-safe
-        self.cache = {}                # auto volumes, manual outlines, hold models
-        self.fcs = OrderedDict()       # per-frame colour data (big: only the last few frames)
+        self.lock = threading.Lock()   # cv2.VideoCapture isn't thread-safe: held while reading a frame
+        self.cache = ByteLRU(CACHE_BYTES)   # decoded frames, per-frame colour data (~60 MB each at 1080p), outlines, models
+        self.reader = None
+        self.touched = time.monotonic()
+        self.discard = False           # freed while busy: free it when it stops
         self.cam, self.moved, self.keyframes = None, 0.0, None   # keyframes: set when the camera moved a lot
 
     # ---------------------------------------------------------------- open + follow the camera
@@ -97,6 +112,9 @@ class Job:
         except Exception as e:
             traceback.print_exc()
             self.state, self.message = "error", f"Couldn't follow the camera ({e}). Try again with the tripod box ticked."
+        if self.discard:                                # the user started over while this ran
+            self.discard = False
+            self.free()
 
     def _sharpest(self, frames, reach=4):
         """A panning phone blurs some frames: swap each keyframe for the sharpest of its neighbours."""
@@ -119,20 +137,18 @@ class Job:
 
     # ---------------------------------------------------------------- the picker's picture
     def frame(self, i):
-        """Frame i (BGR). The last few are kept decoded: a keyframe refresh needs every
-        keyframe several times, and seeking a phone video costs ~0.2 s a frame."""
-        i = max(0, min(int(i), self.reader.total - 1))
+        """Frame i (BGR), shared between callers (don't draw on it). Decoded frames are kept
+        in the job's byte-bounded cache: a keyframe refresh needs every keyframe several
+        times, and seeking a phone video costs ~0.2 s a frame."""
+        reader = self.reader
+        if reader is None:
+            raise PickerError("This climb has been closed. Upload it again.")
+        i = max(0, min(int(i), reader.total - 1))
+        return self.cache.get_or_compute(("frame", i), lambda: self._read(reader, i))
+
+    def _read(self, reader, i):
         with self.lock:
-            cache = self.__dict__.setdefault("decoded", OrderedDict())
-            if i in cache:
-                cache.move_to_end(i)
-                return cache[i]
-            img = self.reader.read(i)
-            if img is not None:
-                cache[i] = img
-                while len(cache) > max(8, len(self.keyframes or []) + 3):
-                    cache.popitem(last=False)
-            return img
+            return reader.read(i)
 
     def picture_jpeg(self, i, width=None):
         img = self.frame(i)
@@ -143,27 +159,20 @@ class Job:
         return cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 88])[1].tobytes()
 
     def cached(self, key, fn):
-        if key not in self.cache:
-            if len(self.cache) > 400:
-                self.cache.clear()
-            self.cache[key] = fn()
-        return self.cache[key]
+        """fn()'s result for key, computed once even when several requests ask at the same time."""
+        return self.cache.get_or_compute(key, fn)
 
     def fc(self, i):
-        """climb_holds.FrameColour of frame i (Lab, hue, chroma, climber mask), kept for the
-        last few frames only: each is ~60 MB at 1080p."""
+        """climb_holds.FrameColour of frame i (Lab, hue, chroma, climber mask). Big, so it
+        shares the job's byte budget with everything else and the oldest go first."""
         i = int(i)
-        with self.lock:
-            hit = self.fcs.get(i)
-            if hit is not None:
-                self.fcs.move_to_end(i)
-                return hit
-        fc = ch.FrameColour(self.frame(i))
-        with self.lock:
-            self.fcs[i] = fc
-            while len(self.fcs) > max(8, len(self.keyframes or []) + 2):
-                self.fcs.popitem(last=False)
-        return fc
+
+        def make():
+            img = self.frame(i)
+            if img is None:
+                raise PickerError(f"Couldn't read frame {i} of the video.")
+            return ch.FrameColour(img)
+        return self.cache.get_or_compute(("fc", i), make)
 
     def lab(self, i):
         return self.fc(i).lab
@@ -199,6 +208,7 @@ class Job:
         Returns (img, holds, vols, info, extra) like climb_holds.interactive, plus counts for the page
         and rejected_auto ([{index, message}]: AUTO clicks that weren't on a hold).
         With keyframes, holds + volumes come back in BASE-frame pixels (img = the base frame)."""
+        st = self.clean_picker(st)
         if self.keyframes:
             return self._build_route_keyframes(st)
         frame = int(st.get("frame", 0))
@@ -216,9 +226,10 @@ class Job:
         manual = []
         for k, c in enumerate(st.get("manual", [])):
             x, y = int(c["x"]), int(c["y"])
-            hold = self.cached(("hold", int(c["frame"]), x, y),
-                               lambda c=c, x=x, y=y: ch.outline_one_hold_img(self.frame(c["frame"]), x, y)
-                               or ch.outline_one_hold(self.lab(c["frame"]), x, y))
+            cf = int(c.get("frame", frame))
+            hold = self.cached(("hold", cf, x, y),
+                               lambda cf=cf, x=x, y=y: ch.outline_one_hold_img(self.frame(cf), x, y)
+                               or ch.outline_one_hold(self.lab(cf), x, y))
             if hold:
                 manual.append(dict(hold, manual_index=k))      # lets the page undo / right-click this click
         starts = [p[:2] for p in st.get("starts", [])]
@@ -250,7 +261,8 @@ class Job:
             pts = [[int(x), int(y)] for x, y in v["points"]]
             return {"contour": pts, "faces": [pts], "source": "manual"}
         x, y = int(v["x"]), int(v["y"])
-        return self.cached(("vol", int(v["frame"]), x, y), lambda: cvol.volume_from_click(self.frame(v["frame"]), x, y))
+        vf = int(v["frame"])
+        return self.cached(("vol", vf, x, y), lambda: cvol.volume_from_click(self.frame(vf), x, y))
 
     def _build_route_keyframes(self, st):
         """The route marked across several keyframes. Each keyframe is detected on its own
@@ -287,7 +299,7 @@ class Job:
         manual = []
         for k, c in enumerate(st.get("manual", [])):
             f, x, y = on(c), int(c["x"]), int(c["y"])
-            hold = self.cached(("hold", f, x, y), lambda: ch.outline_one_hold_img(self.frame(f), x, y)
+            hold = self.cached(("hold", f, x, y), lambda f=f, x=x, y=y: ch.outline_one_hold_img(self.frame(f), x, y)
                                or ch.outline_one_hold(self.lab(f), x, y))
             if hold:
                 manual.append(dict(ca.warp_holds([hold], to_base(f))[0], manual_index=k))
@@ -301,7 +313,7 @@ class Job:
         kept, skipped = [], []
         for f in frames:
             img = self.frame(f)
-            found = [dict(v) for v in self.cached(("vols", f), lambda: cvol.detect_volumes(img))]
+            found = [dict(v) for v in self.cached(("vols", f), lambda img=img: cvol.detect_volumes(img))]
             found = [v for v in found if not any(cvol.inside_volume(v, p) for p in
                                                  cm.warp_points(vols_deleted, self.cam[f]).tolist())] if vols_deleted else found
             k_f, s_f = ch.filter_coloured_volumes(self.lab(f), found, ca.warp_holds(holds, self.cam[f]))
@@ -352,11 +364,145 @@ class Job:
             to_base = np.linalg.inv(self.cam[info["frame"]]) if self.cam is not None else np.eye(3)
         return ca.route_to_base(self.input, self.dir, True, img, holds, info, to_base, self.base)
 
+    # ---------------------------------------------------------------- picker state from the page
+    def clean_picker(self, st):
+        """Check the picker state the page sent and return a copy with every number turned
+        into the right type and the optional parts filled in. Raises PickerError with a
+        message the user can read instead of letting a missing key or a bad number become a 500."""
+        reader = self.reader
+        total = reader.total if reader is not None else 0
+        if self.cam is not None:
+            total = min(total, len(self.cam))
+        if total < 1:
+            raise PickerError("This climb has no frames to mark. Upload it again.")
+        return clean_picker(st, self.width, self.height, total, self.keyframes[0] if self.keyframes else 0)
+
+    # ---------------------------------------------------------------- lifetime
+    def release(self):
+        """Give back the memory: caches and the open video. The files stay (results are served from them)."""
+        self.cache.clear()
+        with self.lock:
+            reader, self.reader = self.reader, None
+            if reader is not None:
+                reader.cap.release()
+
+    def free(self):
+        """Release everything and delete this job's files. A job that is still working is
+        marked and freed when it stops."""
+        if self.state in BUSY:
+            self.discard = True
+            return False
+        self.release()
+        shutil.rmtree(self.dir, ignore_errors=True)
+        return True
+
     # ---------------------------------------------------------------- status
     def status(self):
         return {"id": self.id, "state": self.state, "stage": self.stage, "message": self.message,
                 "progress": round(self.progress, 3), "results": self.results,
                 "info": self.info() if self.state == "picking" else None}
+
+
+def _num(v, what, lo=None, hi=None):
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        raise PickerError(f"{what} should be a number (got {v!r}).")
+    if (lo is not None and v < lo) or (hi is not None and v >= hi):
+        raise PickerError(f"{what} is out of range (got {v:g}).")
+    return v
+
+
+def _frame(v, what, nframes):
+    f = _num(v, what)
+    if f != int(f) or not 0 <= f < nframes:
+        raise PickerError(f"{what} should be a frame number from 0 to {nframes - 1} (got {v:g}).")
+    return int(f)
+
+
+def _point(p, what, w, h, nframes):
+    """[x, y] or [x, y, frame] -> the same shape, checked."""
+    if not isinstance(p, (list, tuple)) or not 2 <= len(p) <= 3:
+        raise PickerError(f"{what} should be [x, y] or [x, y, frame].")
+    out = [_num(p[0], f"{what} x", 0, w), _num(p[1], f"{what} y", 0, h)]
+    if len(p) == 3:
+        out.append(_frame(p[2], f"{what} frame", nframes))
+    return out
+
+
+def _items(st, key):
+    v = st.get(key)
+    if v is None:
+        return []
+    if not isinstance(v, list):
+        raise PickerError(f"'{key}' should be a list.")
+    return v
+
+
+def clean_picker(st, w, h, nframes, default_frame=0):
+    """Validate the page's picker state (shape: see Job.build_route) for a w x h video with
+    nframes frames. Returns a copy with ints where ints are needed and `frame` filled in on
+    clicks that leave it out (= the current frame). Raises PickerError, whose message is fit
+    to show the user (HTTP 400), on anything else."""
+    if not isinstance(st, dict):
+        raise PickerError("The picker state should be an object.")
+    cur = _frame(st["frame"], "frame", nframes) if st.get("frame") is not None else default_frame
+    out = {"frame": cur,
+           "tol": int(_num(st.get("tol", 22), "tol", 0, 256)),
+           "min_size": int(_num(st.get("min_size", 3), "min_size", 0, 1000))}
+    if st.get("frames"):
+        if not isinstance(st["frames"], list):
+            raise PickerError("'frames' should be a list of frame numbers.")
+        out["frames"] = [_frame(f, f"frames[{k}]", nframes) for k, f in enumerate(st["frames"])]
+
+    def frame_of(c, what):
+        return _frame(c["frame"], f"{what} frame", nframes) if c.get("frame") is not None else cur
+
+    def click(c, what):
+        if not isinstance(c, dict):
+            raise PickerError(f"{what} should be an object with x, y and frame.")
+        for k in ("x", "y"):
+            if k not in c:
+                raise PickerError(f"{what} is missing '{k}'.")
+        return {"x": int(_num(c["x"], f"{what} x", 0, w)), "y": int(_num(c["y"], f"{what} y", 0, h)),
+                "frame": frame_of(c, what)}
+    out["auto"] = [click(c, f"auto[{k}]") for k, c in enumerate(_items(st, "auto"))]
+    out["manual"] = [click(c, f"manual[{k}]") for k, c in enumerate(_items(st, "manual"))]
+
+    deleted = []                                       # {x, y, frame, contour} or the old [x, y, frame]
+    for k, d in enumerate(_items(st, "deleted")):
+        what = f"deleted[{k}]"
+        if not isinstance(d, dict):
+            deleted.append(_point(d, what, w, h, nframes))
+        elif d.get("contour"):
+            pts = d["contour"]
+            if not isinstance(pts, list) or len(pts) < 3 or not all(isinstance(q, (list, tuple)) and len(q) == 2 for q in pts):
+                raise PickerError(f"{what} contour should be a list of at least 3 [x, y] points.")
+            deleted.append({"x": _num(d.get("x", 0), f"{what} x"), "y": _num(d.get("y", 0), f"{what} y"),
+                            "frame": frame_of(d, what),
+                            "contour": [[_num(q[0], f"{what} contour x"), _num(q[1], f"{what} contour y")] for q in pts]})
+        else:
+            deleted.append(click(d, what))
+    out["deleted"] = deleted
+
+    out["starts"] = [_point(p, f"starts[{k}]", w, h, nframes) for k, p in enumerate(_items(st, "starts"))]
+    out["end"] = _point(st["end"], "end", w, h, nframes) if st.get("end") else None
+    out["vols_deleted"] = [_point(p, f"vols_deleted[{k}]", w, h, nframes) for k, p in enumerate(_items(st, "vols_deleted"))]
+    vols = []
+    for k, v in enumerate(_items(st, "vols_manual")):
+        what = f"vols_manual[{k}]"
+        if not isinstance(v, dict):
+            raise PickerError(f"{what} should be an object.")
+        if v.get("kind") == "poly":
+            pts = v.get("points")
+            if not isinstance(pts, list) or len(pts) < 3:
+                raise PickerError(f"{what} needs at least 3 corner points.")
+            vols.append({"kind": "poly", "frame": frame_of(v, what),
+                         "points": [_point(q, f"{what} point", w, h, nframes)[:2] for q in pts]})
+        elif v.get("kind") == "click":
+            vols.append(dict(click(v, what), kind="click"))
+        else:
+            raise PickerError(f"{what} kind should be 'click' or 'poly'.")
+    out["vols_manual"] = vols
+    return out
 
 
 def split_deleted(entries, cur):
@@ -526,20 +672,60 @@ class Worker:
 
     def __init__(self):
         self.jobs = {}
+        self.lock = threading.Lock()                    # guards self.jobs and the start transition
         self.q = queue.Queue()
         threading.Thread(target=self._loop, daemon=True).start()
 
     def new_job(self, filename):
         job = Job(filename)
-        self.jobs[job.id] = job
+        with self.lock:
+            self.jobs[job.id] = job
+        self.trim()
         return job
 
+    def get(self, job_id):
+        job = self.jobs.get(job_id)
+        if job is not None:
+            job.touched = time.monotonic()
+        return job
+
+    def remove(self, job_id):
+        """The user started over: free the job (its memory, open video and files)."""
+        with self.lock:
+            job = self.jobs.pop(job_id, None)
+        if job is not None:
+            job.free()
+        return job is not None
+
+    def trim(self):
+        """Keep only the MAX_KEPT_JOBS most recently used jobs that aren't busy; free the rest."""
+        with self.lock:
+            idle = sorted((j for j in self.jobs.values() if j.state not in BUSY and not j.discard),
+                          key=lambda j: j.touched, reverse=True)
+            drop = idle[MAX_KEPT_JOBS:]
+            for j in drop:
+                del self.jobs[j.id]
+        for j in drop:
+            j.free()
+
     def start(self, job, picker_state, model, notes, use_lock):
-        if picker_state:
-            job.holds, job.vols = job.route_for_analysis(picker_state)
-        else:
-            job.holds, job.vols = [], []
+        """picking/error -> starting -> queued. The first caller flips the state under the lock,
+        so a second request (Enter plus a click) gets JobBusy instead of queueing the job twice."""
+        with self.lock:
+            if job.state not in ("picking", "error"):
+                raise JobBusy("This climb is already being analyzed.")
+            before = job.state
+            job.state, job.stage, job.message, job.progress = "starting", "", "Marking the route", 0.0
+        try:
+            if picker_state:
+                job.holds, job.vols = job.route_for_analysis(picker_state)
+            else:
+                job.holds, job.vols = [], []
+        except BaseException:
+            job.state = before
+            raise
         job.model, job.notes, job.use_lock = model, notes, use_lock
+        job.cache.clear()                               # the picker's frames and colour data aren't needed any more
         job.state, job.stage, job.progress = "queued", "queued", 0.0
         job.message = "Waiting for the previous climb to finish"
         self.q.put(job)
@@ -548,10 +734,23 @@ class Worker:
         while True:
             job = self.q.get()
             try:
-                self._run(job)
+                if not job.discard:
+                    self._run(job)
             except Exception as e:                      # show the error on the page, keep the server alive
                 traceback.print_exc()
                 job.state, job.message = "error", f"Analysis failed: {e}"
+            finally:
+                if job.state in ("queued", "running"):  # never leave it looking busy
+                    job.state = "error"
+                if job.state == "done":
+                    job.release()                       # results are files now: drop the video and caches
+                if job.discard:                         # the user started over while it ran
+                    job.discard = False
+                    with self.lock:
+                        self.jobs.pop(job.id, None)
+                    job.free()
+                else:
+                    self.trim()
 
     def _run(self, job):
         job.state = "running"

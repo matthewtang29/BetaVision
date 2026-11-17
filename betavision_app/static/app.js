@@ -48,7 +48,7 @@ async function api(path, body) {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   });
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.detail || `Something went wrong (${r.status})`);
+  if (!r.ok) throw new Error(typeof data.detail === "string" && data.detail ? data.detail : `Something went wrong (${r.status})`);
   return data;
 }
 
@@ -481,41 +481,62 @@ function clearAll() {
   refreshRoute();
 }
 
-// ask the server for outlines; ignore answers that arrive out of order
-let seq = 0, refreshTimer = null;
+// Ask the server for outlines. One request at a time: while one is out, further changes only
+// mark the state dirty, and when it comes back the LATEST state is sent (changes in between are
+// merged, so dragging the tolerance slider never queues up work on the server).
+let refreshTimer = null, inFlight = false, dirty = false;
+function setPending(on) { $("canvas-busy").hidden = !on; }
+
 function refreshRoute() {
   updateStatus();
   draw();
+  if (!job || !P) return;
+  dirty = true;
+  setPending(true);
   clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(async () => {
-    const mine = ++seq;
-    try {
-      const data = await api(`/api/jobs/${job.id}/holds`, P);
-      if (mine !== seq) return;
-      if (data.failed_volumes.length) {          // a V click that found no volume: drop it again
-        data.failed_volumes.slice().reverse().forEach((k) => {
-          P.vols_manual.splice(k, 1);
-          const at = history.lastIndexOf("vol_manual");
-          if (at >= 0) history.splice(at, 1);
-        });
-        flash("Couldn't find a volume there. Try its middle, or trace its corners (P).");
-        return refreshRoute();
-      }
-      if (data.rejected_auto && data.rejected_auto.length) {   // an AUTO click that wasn't on a hold
-        data.rejected_auto.slice().reverse().forEach(({ index }) => {
-          P.auto.splice(index, 1);
-          const at = history.lastIndexOf("sample");
-          if (at >= 0) history.splice(at, 1);
-        });
-        flash(data.rejected_auto[data.rejected_auto.length - 1].message);
-        renderStrip();
-        return refreshRoute();
-      }
-      holds = data.holds; vols = data.volumes; skippedVols = data.skipped_volumes;
-      updateStatus(); draw();
-      if (P.frames) renderStrip();                 // a frame's × hides once it has marks
-    } catch (e) { flash(e.message); }
-  }, 60);
+  refreshTimer = setTimeout(sendRoute, 60);
+}
+
+async function sendRoute() {
+  if (inFlight) return;                          // the running request's finish sends the latest state
+  if (!dirty || !job || !P) { dirty = false; setPending(false); return; }
+  inFlight = true; dirty = false;
+  const jid = job.id, sent = P;
+  try {
+    const data = await api(`/api/jobs/${jid}/holds`, sent);
+    if (!job || job.id !== jid || P !== sent) return;   // started over or another video meanwhile
+    const current = !dirty;                      // nothing changed while this was out
+    if (current && data.failed_volumes.length) { // a V click that found no volume: drop it again
+      data.failed_volumes.slice().reverse().forEach((k) => {
+        P.vols_manual.splice(k, 1);
+        const at = history.lastIndexOf("vol_manual");
+        if (at >= 0) history.splice(at, 1);
+      });
+      flash("Couldn't find a volume there. Try its middle, or trace its corners (P).");
+      refreshRoute();
+    } else if (current && data.rejected_auto && data.rejected_auto.length) {   // an AUTO click that wasn't on a hold
+      data.rejected_auto.slice().reverse().forEach(({ index }) => {
+        P.auto.splice(index, 1);
+        const at = history.lastIndexOf("sample");
+        if (at >= 0) history.splice(at, 1);
+      });
+      flash(data.rejected_auto[data.rejected_auto.length - 1].message);
+      renderStrip();
+      refreshRoute();
+    } else {
+      if (!data.failed_volumes.length && !(data.rejected_auto || []).length) {
+        holds = data.holds; vols = data.volumes; skippedVols = data.skipped_volumes;
+        updateStatus(); draw();
+        if (P.frames) renderStrip();             // a frame's × hides once it has marks
+      }                                          // (else: the newer state that's queued sorts it out)
+    }
+  } catch (e) {
+    if (job && job.id === jid) flash(e.message);
+  } finally {
+    inFlight = false;
+    if (dirty) { clearTimeout(refreshTimer); refreshTimer = setTimeout(sendRoute, 0); }
+    else setPending(false);
+  }
 }
 
 function setMode(m) {
@@ -551,7 +572,8 @@ function updateStatus() {
   $("n-vols").textContent = `${vols.length} volume${vols.length === 1 ? "" : "s"}` +
     (skippedVols ? ` (${skippedVols} painted, skipped)` : "");
   $("n-cuts").textContent = nCut ? `${nCut} off-route cut out` : "";
-  $("analyze").disabled = holds.length === 0;
+  $("analyze").disabled = holds.length === 0 || starting;
+  $("skip").disabled = starting;
   $("undo").disabled = history.length === 0;
 }
 
@@ -634,7 +656,12 @@ $("analyze").addEventListener("click", () => analyze(true));
 $("skip").addEventListener("click", () => analyze(false));
 
 // ------------------------------------------------------------------ 3. run
+let starting = false;                            // a start request is out: Enter / clicks are ignored meanwhile
 async function analyze(withHolds) {
+  if (starting || !job) return;
+  starting = true;
+  $("analyze").setAttribute("aria-busy", "true");
+  updateStatus();
   $("notes-error").hidden = true;
   try {
     await api(`/api/jobs/${job.id}/start`, {
@@ -644,6 +671,10 @@ async function analyze(withHolds) {
     if (e.message.startsWith("Sticky notes")) { $("notes-error").textContent = e.message; $("notes-error").hidden = false; $("notes").focus(); }
     else flash(e.message);
     return;
+  } finally {
+    starting = false;
+    $("analyze").removeAttribute("aria-busy");
+    updateStatus();
   }
   startPolling("Reading the beta…", 3);
 }
@@ -703,6 +734,8 @@ function showResults(r) {
 // ------------------------------------------------------------------ start over
 function restart() {
   clearInterval(pollTimer);
+  if (jobId) fetch(`/api/jobs/${jobId}`, { method: "DELETE", keepalive: true }).catch(() => {});   // let the server free it
+  clearTimeout(refreshTimer); dirty = false; setPending(false);
   $("player").removeAttribute("src");
   $("player").load();
   job = null; P = null; holds = []; vols = []; jobId = null;
