@@ -312,7 +312,7 @@ def test_web_summary_still_has_labelled_moves(jobs_mod):
 def test_library_endpoints(jobs_mod):
     from fastapi.testclient import TestClient
     from betavision_app import server
-    c = TestClient(server.app)
+    c = TestClient(server.app, base_url="http://127.0.0.1:8765")
     r = c.get("/api/library").json()
     assert r["enabled"] is True and r["climbs"] == 0 and r["routes"] == []
     for d in (1, 2):

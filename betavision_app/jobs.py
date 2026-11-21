@@ -30,7 +30,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
-import imageio_ffmpeg
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -47,7 +46,12 @@ import climb_volumes as cvol       # noqa: E402
 from .cache import ByteLRU          # noqa: E402
 
 WORKSPACE = ROOT / "workspace"     # uploads + outputs, wiped every time the app starts
-VIDEO_TYPES = {".mp4", ".mov", ".avi"}
+VIDEO_TYPES = {".mp4", ".mov", ".m4v", ".avi"}
+
+# Limits for uploads (override with environment variables if a longer climb needs it).
+MAX_UPLOAD_MB = int(os.environ.get("BETAVISION_MAX_UPLOAD_MB", 2048))     # file size
+MAX_MINUTES = float(os.environ.get("BETAVISION_MAX_MINUTES", 10))         # video length
+MAX_SIDE = int(os.environ.get("BETAVISION_MAX_SIDE", 4096))               # longest side in px (4K phone video fits)
 LIMB_NAMES = lib.LIMB_NAMES
 ANGLE_NAMES = lib.ANGLE_NAMES
 CACHE_BYTES = int(float(os.environ.get("BETAVISION_CACHE_MB", 1536)) * 1024 * 1024)   # per job: frames, colour data, outlines
@@ -102,6 +106,13 @@ class Job:
             raise ValueError("Couldn't read that video. Try exporting it again as .mp4.")
         self.reader = ch.FrameReader(self.input)
         self.height, self.width = frame.shape[:2]
+        if max(self.width, self.height) > MAX_SIDE:
+            raise ValueError(f"That video is {self.width}x{self.height}. BetaVision handles up to "
+                             f"{MAX_SIDE} px on the longest side (4K). Export it at 4K or 1080p and try again.")
+        minutes = self.reader.total / (self.reader.fps or 30.0) / 60
+        if minutes > MAX_MINUTES:
+            raise ValueError(f"That video is {minutes:.0f} minutes long. BetaVision handles up to "
+                             f"{MAX_MINUTES:g} minutes: trim it to the climb and try again.")
         self.still = still
         self.base = 0 if still else self.reader.total // 2          # same base frame as the CLI
         self.state = "preparing"
@@ -440,7 +451,7 @@ class Job:
     def status(self):
         return {"id": self.id, "state": self.state, "stage": self.stage, "message": self.message,
                 "progress": round(self.progress, 3), "results": self.results, "compare": self.compare,
-                "info": self.info() if self.state == "picking" else None}
+                "info": self.info() if self.state == "picking" and self.reader is not None else None}
 
 
 def _num(v, what, lo=None, hi=None):
@@ -679,10 +690,46 @@ def summarize(job, res, holds, vols):
 
 
 def to_h264(src, dst):
-    """OpenCV writes mp4v, which browsers won't play. Re-encode with the ffmpeg
-    that ships inside the imageio-ffmpeg wheel (nothing to install separately)."""
+    """OpenCV writes mp4v, which browsers won't play, so re-encode to H.264.
+    On Windows this uses Windows' own encoder (Media Foundation): the ffmpeg.exe in the
+    imageio-ffmpeg wheel is unsigned, and Smart App Control blocks it on some PCs."""
+    if sys.platform == "win32":
+        try:
+            _h264_media_foundation(src, dst)
+            return
+        except Exception as e:
+            print(f"Windows H.264 encoder failed ({e}), trying ffmpeg instead")
+    _h264_ffmpeg(src, dst)
+
+
+def _h264_media_foundation(src, dst):
+    cap = cv2.VideoCapture(str(src))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) // 2 * 2                  # H.264 4:2:0 needs even sizes
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) // 2 * 2
+    out = cv2.VideoWriter(str(dst), cv2.CAP_MSMF, cv2.VideoWriter_fourcc(*"H264"), fps, (w, h))
+    try:
+        if not out.isOpened():
+            raise RuntimeError("Media Foundation H.264 writer didn't open")
+        n = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            out.write(frame[:h, :w])
+            n += 1
+        if n == 0:
+            raise RuntimeError("no frames to encode")
+    finally:
+        cap.release()
+        out.release()
+
+
+def _h264_ffmpeg(src, dst):
+    """The ffmpeg that ships inside the imageio-ffmpeg wheel (nothing to install separately)."""
+    import imageio_ffmpeg
     cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error", "-i", str(src),
-           "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",          # H.264 4:2:0 needs even sizes
+           "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
            "-movflags", "+faststart", "-an", str(dst)]
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)          # no console flash on Windows
@@ -811,6 +858,11 @@ class Worker:
         threading.Thread(target=self._loop, daemon=True).start()
 
     def new_job(self, filename):
+        with self.lock:
+            others = list(self.jobs.values())
+        for old in others:                           # only one video is open in the page at a time
+            if not old.busy():
+                old.release()
         job = Job(filename)
         with self.lock:
             self.jobs[job.id] = job
@@ -830,6 +882,12 @@ class Worker:
         if job is not None:
             job.free()
         return job is not None
+
+    def discard(self, job):
+        """Delete a video and everything made from it (a failed upload, or the page's Delete button)."""
+        if job.state == "uploading":                    # it never opened, so nothing is working on it
+            job.state = "error"
+        self.remove(job.id)
 
     def trim(self):
         """Keep only the MAX_KEPT_JOBS most recently used jobs that aren't busy; free the rest."""
@@ -874,7 +932,13 @@ class Worker:
                     self._run(job)
             except Exception as e:                      # show the error on the page, keep the server alive
                 traceback.print_exc()
-                job.state, job.message = "error", f"Analysis failed: {e}"
+                if getattr(e, "winerror", None) == 4551:    # Smart App Control / App Control for Business
+                    msg = (f"Windows blocked a file BetaVision needs, during \"{job.message}\""
+                           + (f" ({Path(e.filename).name})" if getattr(e, "filename", None) else "")
+                           + ". The console window has the details.")
+                else:
+                    msg = f"Analysis failed: {e}"
+                job.state, job.message = "error", msg
             finally:
                 if job.state in ("queued", "running"):  # never leave it looking busy
                     job.state = "error"

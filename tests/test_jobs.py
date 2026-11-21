@@ -108,7 +108,7 @@ def client(jobs_mod, video, monkeypatch):
     from betavision_app import server
     monkeypatch.setattr(server.worker, "q", FakeQueue())
     server.worker.jobs.clear()
-    with TestClient(server.app) as c:
+    with TestClient(server.app, base_url="http://127.0.0.1:8765") as c:
         yield c, server
     server.worker.jobs.clear()
 

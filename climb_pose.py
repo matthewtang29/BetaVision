@@ -77,7 +77,14 @@ def ensure_model(kind: str) -> Path:
             old.replace(path)
         else:
             print(f"Downloading {kind} pose model (one time only) ...")
-            urllib.request.urlretrieve(MODEL_URLS[kind], path)
+            part = path.with_name(path.name + ".part")   # a cut-off download never looks finished
+            try:
+                urllib.request.urlretrieve(MODEL_URLS[kind], part)
+                part.replace(path)
+            except OSError as e:
+                part.unlink(missing_ok=True)
+                raise RuntimeError(f"Couldn't download the {kind} pose model ({e}). "
+                                   "Check your internet connection and try again.") from e
     return path
 
 

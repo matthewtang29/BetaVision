@@ -209,7 +209,7 @@ def test_page_checkbox_reaches_the_analysis(jobs_mod, video, monkeypatch):
             pass
     monkeypatch.setattr(server.worker, "q", Q())
     server.worker.jobs.clear()
-    with TestClient(server.app) as c:
+    with TestClient(server.app, base_url="http://127.0.0.1:8765") as c:
         for flag in (False, True):
             r = c.post("/api/upload", files={"file": ("wall.avi", video.read_bytes())}, data={"still": "true"})
             jid = r.json()["id"]

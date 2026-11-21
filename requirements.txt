@@ -9,4 +9,4 @@ starlette==1.8.0
 pydantic==2.14.1
 uvicorn==0.54.0
 python-multipart==0.0.32
-imageio-ffmpeg==0.6.0    # bundles ffmpeg, used to make the browser-playable H.264 video
+imageio-ffmpeg==0.6.0    # bundled ffmpeg for the browser-playable H.264 video (Windows uses its own encoder)
