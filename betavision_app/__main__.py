@@ -9,6 +9,7 @@ run_betavision.bat does this for you on Windows.
 """
 
 import argparse
+import json
 import os
 import shutil
 import socket
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import webbrowser
 
 sys.dont_write_bytecode = True     # same as climb_analyze.py: no __pycache__ folders
@@ -25,6 +27,30 @@ def port_in_use(host, port):
     with socket.socket() as s:
         s.settimeout(0.5)
         return s.connect_ex((host, port)) == 0
+
+
+def is_betavision(host, port):
+    """Something is listening on the port: is it BetaVision? (Another local server, e.g. a
+    `python -m http.server` left running, can use the same port.)"""
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/api/limits", timeout=1.5) as r:
+            return "max_upload_mb" in json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return False
+
+
+def find_port(host, start, tries=20):
+    """From `start` on: (port, True) for the first port already running BetaVision, else
+    (port, False) for the first free one, skipping ports other programs use. (None, False)
+    if all are taken by other programs."""
+    free = None
+    for p in range(start, start + tries):
+        if not port_in_use(host, p):
+            if free is None:
+                free = p
+        elif is_betavision(host, p):
+            return p, True
+    return free, False
 
 
 def app_browser():
@@ -62,7 +88,7 @@ def show(url, window):
 
 def open_when_ready(url, host, port, window):
     for _ in range(120):               # the first start can be slow (MediaPipe import)
-        if port_in_use(host, port):
+        if is_betavision(host, port):
             show(url, window)
             return
         time.sleep(0.5)
@@ -76,14 +102,22 @@ def main():
     ap.add_argument("--window", action="store_true",
                     help="open the app in its own window (Edge or Chrome app mode), else a browser tab")
     args = ap.parse_args()
-    url = f"http://{args.host}:{args.port}/"
     opening = args.open or args.window
 
-    if port_in_use(args.host, args.port):  # already running (e.g. double-clicked twice): just show it
+    port, running = find_port(args.host, args.port)
+    if port is None:
+        sys.exit(f"Port {args.port} is used by another program, and so are the next 19. "
+                 "Close it, or start BetaVision with --port <a free port>.")
+    if running:                                 # already running (e.g. double-clicked twice): just show it
+        url = f"http://{args.host}:{port}/"
         print(f"BetaVision is already running at {url}")
         if opening:
             show(url, args.window)
         return
+    if port != args.port:
+        print(f"Port {args.port} is used by another program, so BetaVision is using port {port} instead.")
+    args.port = port
+    url = f"http://{args.host}:{args.port}/"
 
     from . import jobs
     jobs.reset_workspace()
