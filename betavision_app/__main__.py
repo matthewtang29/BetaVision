@@ -1,7 +1,7 @@
 """
 Start the BetaVision web app:
 
-    python -m betavision_app            # http://127.0.0.1:8765
+    python -m betavision_app            # http://127.0.0.1:8780
     python -m betavision_app --open     # ... and open it in the default browser
     python -m betavision_app --window   # ... and open it in its own app window (Edge / Chrome)
 
@@ -97,7 +97,7 @@ def open_when_ready(url, host, port, window):
 def main():
     ap = argparse.ArgumentParser(description="BetaVision local web app")
     ap.add_argument("--host", default="127.0.0.1", help="default 127.0.0.1 (this computer only)")
-    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--port", type=int, default=8780)   # not 8765: other local tools commonly use it
     ap.add_argument("--open", action="store_true", help="open the app in your browser")
     ap.add_argument("--window", action="store_true",
                     help="open the app in its own window (Edge or Chrome app mode), else a browser tab")

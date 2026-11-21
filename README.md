@@ -106,7 +106,7 @@ pip install -r requirements.txt
 python -m betavision_app --window      # or --open for a normal browser tab
 ```
 
-It runs at <http://127.0.0.1:8765>. In Chrome or Edge, click the install icon in the address bar to add it as an app; if BetaVision isn't running when you open the app, it tells you how to start it.
+It runs at <http://127.0.0.1:8780> (or the next free port, if another program is using that one). In Chrome or Edge, click the install icon in the address bar to add it as an app; if BetaVision isn't running when you open the app, it tells you how to start it.
 
 ### Using the web app
 
